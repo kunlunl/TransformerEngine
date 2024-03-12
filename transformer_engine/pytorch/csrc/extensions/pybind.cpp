@@ -12,6 +12,13 @@
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   //CP Flash Attention THD
   m.def("lse_correction", &lse_correction, "Lse Correction");
+  m.def("cp_thd_read_half_tensor", &cp_thd_read_half_tensor, "Read half tensor with THD format for Context Parallel");
+  m.def("out_correction_thd", &out_correction_thd, "out_correction_thd");
+  m.def("out_correction_thd2", &out_correction_thd2, "out_correction_thd2");
+  m.def("cp_thd_bwd_lse", &cp_thd_bwd_lse, "cp_thd_bwd_lse");
+  m.def("generate_thd_indices_for_cp", &generate_thd_indices_for_cp, "generate_thd_indices_for_cp");
+  m.def("thd_op1", &thd_op1, "thd_op1");
+  m.def("thd_op2", &thd_op2, "thd_op2");
   // Softmax functions
   m.def("scaled_softmax_forward", &scaled_softmax_forward, "Scaled Softmax FWD");
   m.def("scaled_softmax_backward", &scaled_softmax_backward, "Scaled Softmax BWD");

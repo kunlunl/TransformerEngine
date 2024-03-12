@@ -514,11 +514,14 @@ class AttnFuncWithCP(torch.autograd.Function):
             # [b, s, np, hn] -> [b, 2, s//2, np, hn]
             q, k, v = [x.view(x.shape[0], 2, x.shape[1]//2, *x.shape[2:]) for x in [q, k, v]]
 
-        if thd:
-            # Compute the indices needed when q/k/v are in thd format
-            l_q, r_q, cr_q, ct_q, cht_q = get_thd_indices_with_cp(cu_seqlens_q, max_seqlen_q)
-            # c_right, c_total, ch_total of k/v are not used
-            l_k, r_k,    _,    _,     _ = get_thd_indices_with_cp(cu_seqlens_k, max_seqlen_k)
+        # if thd:
+        # Compute the indices needed when q/k/v are in thd format
+        # l_q, r_q, cr_q, ct_q, cht_q = get_thd_indices_with_cp(cu_seqlens_q, max_seqlen_q)
+        # c_right, c_total, ch_total of k/v are not used
+        # l_k, r_k,    _,    _,     _ = get_thd_indices_with_cp(cu_seqlens_k, max_seqlen_k)
+        # q_idx = tex.generate_thd_indices_for_cp(cu_seqlens_q, q.size(0))
+        # k_idx = tex.generate_thd_indices_for_cp(cu_seqlens_k, k.size(0))
+        # k_idx = q_idx
 
         assert(q.shape[-1] % 8 == 0), "hidden size per attention head should be multiple of 8"
         fa_optional_forward_kwargs = {}
@@ -611,7 +614,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                                 q_inputs[i%2] = q.view(-1, *q.shape[-2:])
                                 if thd:
                                     # [2, t, np, hn] -> [2, t/2, np, hn]
-                                    kv_inputs[i%2] = kv_inputs[i%2][:, l_k, ...].contiguous()
+                                    # kv_inputs[i%2] = kv_inputs[i%2][:, l_k, ...].contiguous()
+                                    # print("half kv")
+                                    kv_inputs[i%2] = tex.cp_thd_read_half_tensor(kv_inputs[i%2], cu_seqlens_k, 1, False)
                                 else:
                                     # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn]
                                     kv_inputs[i%2] = kv_inputs[i%2][:, :, 0, ...].contiguous()
@@ -645,7 +650,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                             else:
                                 if thd:
                                     # [t, np, hn] -> [t/2, np, hn]
-                                    q_inputs[i%2] = q[r_q, ...].contiguous()
+                                    # q_inputs[i%2] = q[r_q, ...].contiguous()
+                                    # print("half q")
+                                    q_inputs[i%2] = tex.cp_thd_read_half_tensor(q, cu_seqlens_q, 0, True)
                                 else:
                                     # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                                     q_inputs[i%2] = q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
@@ -710,7 +717,7 @@ class AttnFuncWithCP(torch.autograd.Function):
                             b, np, sq = softmax_lse.shape
                             total_tokens = q.shape[0]
                             tex.lse_correction(softmax_lse, softmax_lse_per_step[i-1], cu_seqlens_q, b, np, sq, total_tokens, 108)
-                        else:    
+                        else:
                             flash_attn_fwd_softmax_lse_correction(softmax_lse_[..., 1, :],
                                                                   softmax_lse_per_step[i-1])
 
@@ -720,10 +727,10 @@ class AttnFuncWithCP(torch.autograd.Function):
         torch.cuda.current_stream().wait_stream(flash_attn_streams[1])
 
         softmax_lse = softmax_lse.to(torch.float)
-        if thd:
-            b, np, sq = softmax_lse.shape
-            # [b, np, sq] -> [b, sq, np] -> [b*sq, np]
-            softmax_lse = softmax_lse.transpose(1, 2).contiguous().view(-1, np)
+        # if thd:
+        #     b, np, sq = softmax_lse.shape
+        #     # [b, np, sq] -> [b, sq, np] -> [b*sq, np]
+        #     softmax_lse = softmax_lse.transpose(1, 2).contiguous().view(-1, np)
 
         for i in range(cp_size):
             if thd:
@@ -735,13 +742,15 @@ class AttnFuncWithCP(torch.autograd.Function):
             if i <= rank or not causal:
                 if thd:
                     # [b*sq, np] -> [t, np]
-                    lse = softmax_lse[ct_q]
-                    lse_per_step = softmax_lse_per_step[i]
+                    # lse = softmax_lse[ct_q]
+                    # lse_per_step = softmax_lse_per_step[i]
                     # [b, np, sq] -> [b, sq, np] -> [b*sq, np]
-                    lse_per_step = lse_per_step.transpose(1, 2).contiguous().view(-1, np)
+                    # lse_per_step = lse_per_step.transpose(1, 2).contiguous().view(-1, np)
                     # [b*sq, np] -> [t, np]
-                    lse_per_step = lse_per_step[ct_q]
-                    flash_attn_fwd_out_correction_thd(out, out_, lse, lse_per_step)
+                    # lse_per_step = lse_per_step[ct_q]
+                    # flash_attn_fwd_out_correction_thd(out, out_, lse, lse_per_step)
+                    # print("out_correction")
+                    tex.out_correction_thd(out, out_, softmax_lse, softmax_lse_per_step[i], cu_seqlens_q)
                 else:
                     flash_attn_fwd_out_correction(out.view(*out_.shape),
                                                   out_,
@@ -750,25 +759,27 @@ class AttnFuncWithCP(torch.autograd.Function):
             else:
                 if thd:
                     # [b*sq, np] -> [t/2, np]
-                    lse = softmax_lse[cr_q]
-                    lse_per_step = softmax_lse_per_step[i]
+                    # lse = softmax_lse[cr_q]
+                    # lse_per_step = softmax_lse_per_step[i]
                     # [b, np, sq/2] -> [b, sq/2, np] -> [b*sq/2, np]
-                    lse_per_step = lse_per_step.transpose(1, 2).contiguous().view(-1, np)
+                    # lse_per_step = lse_per_step.transpose(1, 2).contiguous().view(-1, np)
                     # [b*sq/2, np] -> [t/2, np]
-                    lse_per_step = lse_per_step[cht_q]
+                    # lse_per_step = lse_per_step[cht_q]
                     # [t, np, hn] -> [t/2, np, hn]
-                    tmp_out = out[r_q]
-                    flash_attn_fwd_out_correction_thd(tmp_out, out_, lse, lse_per_step)
-                    out[r_q] = tmp_out
+                    # tmp_out = out[r_q]
+                    # flash_attn_fwd_out_correction_thd(tmp_out, out_, lse, lse_per_step)
+                    # out[r_q] = tmp_out
+                    # print("out_correction2")
+                    tex.out_correction_thd2(out, out_, softmax_lse, softmax_lse_per_step[i], cu_seqlens_q)
                 else:
                     flash_attn_fwd_out_correction(out[:, 1, ...],
                                                   out_,
                                                   softmax_lse_[..., 1, :],
                                                   softmax_lse_per_step[i])
 
-        if thd:
-            # [b*sq, np] -> [b, sq, np] -> [b, np, sq]
-            softmax_lse = softmax_lse.view(b, sq, np).transpose(1, 2).contiguous()
+        # if thd:
+        #     # [b*sq, np] -> [b, sq, np] -> [b, np, sq]
+        #     softmax_lse = softmax_lse.view(b, sq, np).transpose(1, 2).contiguous()
 
         kv = p2p_comm_buffers[-1]
         if use_fused_attention:
@@ -776,10 +787,7 @@ class AttnFuncWithCP(torch.autograd.Function):
         else:
             out = out.view(-1, *out.shape[-2:])
 
-        if thd:
-            ctx.save_for_backward(q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, l_q, r_q, cr_q, cht_q, l_k, r_k)
-        else:
-            ctx.save_for_backward(q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
+        ctx.save_for_backward(q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
         ctx.thd = thd
         ctx.rng_states = rng_states
         ctx.cp_group = cp_group
@@ -795,10 +803,7 @@ class AttnFuncWithCP(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout):
-        if ctx.thd:
-            q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, l_q, r_q, cr_q, cht_q, l_k, r_k = ctx.saved_tensors
-        else:
-            q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
 
         cp_size = get_distributed_world_size(ctx.cp_group)
         rank = get_distributed_rank(ctx.cp_group)
@@ -808,10 +813,11 @@ class AttnFuncWithCP(torch.autograd.Function):
 
         if ctx.causal:
             if ctx.thd:
-                b, np, sq = softmax_lse.shape
-                softmax_lse_ = torch.zeros([b * sq//2, np], dtype=softmax_lse.dtype).cuda()
-                softmax_lse_[cht_q] = softmax_lse.transpose(1, 2).contiguous().view(-1, np)[cr_q]
-                softmax_lse_ = softmax_lse_.view(b, sq//2, np).transpose(1, 2).contiguous()
+                # b, np, sq = softmax_lse.shape
+                # softmax_lse_ = torch.zeros([b * sq//2, np], dtype=softmax_lse.dtype).cuda()
+                # softmax_lse_[cht_q] = softmax_lse.transpose(1, 2).contiguous().view(-1, np)[cr_q]
+                # softmax_lse_ = softmax_lse_.view(b, sq//2, np).transpose(1, 2).contiguous()
+                softmax_lse_ = tex.cp_thd_bwd_lse(softmax_lse, cu_seqlens_q, q.size(0))
             else:
                 # [b, np, sq] -> [b, np, 2, sq//2]
                 softmax_lse_ = softmax_lse.view(*softmax_lse.shape[:-1], 2, softmax_lse.shape[-1]//2)
@@ -930,7 +936,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                         dq_ = torch.empty_like(q_)
                         if ctx.thd:
                             # [2, t, np, hn] -> [2, t/2, np, hn]
-                            kv_ = kv[:, l_k, ...].contiguous()
+                            # kv_ = kv[:, l_k, ...].contiguous()
+                            # print("BWD half kv")
+                            kv_ = tex.cp_thd_read_half_tensor(kv, cu_seqlens_k, 1, False)
                         else:
                             # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn] -> [2, b*sk//2, np, hn]
                             kv_ = kv[:, :, 0, ...].contiguous().view(2, -1, *kv.shape[-2:])
@@ -971,7 +979,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                     else:
                         if ctx.thd:
                             # [t, np, hn] -> [t/2, np, hn]
-                            q_ = q[r_q, ...].contiguous()
+                            # q_ = q[r_q, ...].contiguous()
+                            # print("BWD half q")
+                            q_ = tex.cp_thd_read_half_tensor(q, cu_seqlens_q, 0, True)
                         else:
                             # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                             q_ = q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
@@ -980,8 +990,11 @@ class AttnFuncWithCP(torch.autograd.Function):
                         kv_ = kv.view(2, -1, *kv.shape[-2:])
                         dkv_ = torch.empty_like(kv_)
                         if ctx.thd:
-                            out_ = out[r_q, ...].contiguous()
-                            dout_ = dout[r_q, ...].contiguous()
+                            # out_ = out[r_q, ...].contiguous()
+                            # dout_ = dout[r_q, ...].contiguous()
+                            # print("BWD half out and half dout")
+                            out_ = tex.cp_thd_read_half_tensor(out, cu_seqlens_q, 0, True)
+                            dout_ = tex.cp_thd_read_half_tensor(dout, cu_seqlens_q, 0, True)
                         else:
                             # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                             out_ = out[:, 1, ...].contiguous().view(-1, *out.shape[-2:])
@@ -1046,19 +1059,22 @@ class AttnFuncWithCP(torch.autograd.Function):
                         dq.copy_(dq_)
                     else:
                         if ctx.thd:
-                            dq[l_q] = dq_[l_q]
-                            dq[r_q] = dq[r_q].add_(dq_[r_q])
+                            # dq[q_idx[0]] = dq_[q_idx[0]]
+                            # dq[q_idx[1]] = dq[q_idx[1]].add_(dq_[q_idx[1]])
+                            tex.thd_op2(dq, dq_, cu_seqlens_q, 0, 0)
                         else:
                             dq[:, 0, ...].copy_(dq_[:, 0, ...])
                             dq[:, 1, ...].add_(dq_[:, 1, ...])
                 elif i > 0:
                     if ctx.thd:
-                        dq[r_q] = dq[r_q].add_(dq_)
+                        # dq[q_idx[1]] = dq[q_idx[1]].add_(dq_)
+                        tex.thd_op1(dq, dq_, cu_seqlens_q, 1, 1, 0)
                     else:
                         dq[:, 1, ...].add_(dq_)
                 else:
                     if ctx.thd:
-                        dq[r_q] = dq_
+                        # dq[q_idx[1]] = dq_
+                        tex.thd_op1(dq, dq_, cu_seqlens_q, 1, 0, 0)
                     else:
                         dq[:, 1, ...].copy_(dq_)
             else:
@@ -1088,8 +1104,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                 if i == (cp_size-1):
                     if rank == 0:
                         if ctx.thd:
-                            dkv[:, l_k, ...] = dkv[:, l_k, ...].add_(dkv_[:, l_k, ...])
-                            dkv[:, r_k, ...] = dkv_[:, r_k, ...]
+                            # dkv[:, k_idx[0], ...] = dkv[:, k_idx[0], ...].add_(dkv_[:, k_idx[0], ...])
+                            # dkv[:, k_idx[1], ...] = dkv_[:, k_idx[1], ...]
+                            tex.thd_op2(dkv, dkv_, cu_seqlens_k, 1, 1)
                         else:
                             dkv[:, :, 0, ...].add_(dkv_[:, :, 0, ...])
                             dkv[:, :, 1, ...].copy_(dkv_[:, :, 1, ...])
@@ -1098,12 +1115,14 @@ class AttnFuncWithCP(torch.autograd.Function):
                 elif i >= (cp_size-rank-1):
                     if i == 0 and rank == (cp_size-1):
                         if ctx.thd:
-                            dkv[:, l_k] = dkv_
+                            # dkv[:, k_idx[0]] = dkv_
+                            tex.thd_op1(dkv, dkv_, cu_seqlens_k, 0, 0, 1)
                         else:
                             dkv[:, :, 0, ...].copy_(dkv_)
                     else:
                         if ctx.thd:
-                            dkv[:, l_k, ...] = dkv[:, l_k, ...].add_(dkv_)
+                            # dkv[:, k_idx[0], ...] = dkv[:, k_idx[0], ...].add_(dkv_)
+                            tex.thd_op1(dkv, dkv_, cu_seqlens_k, 0, 1, 1)
                         else:
                             dkv[:, :, 0, ...].add_(dkv_)
                 elif i > 0:

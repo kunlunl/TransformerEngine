@@ -565,3 +565,12 @@ void placeholder();
 void lse_correction(at::Tensor &lse, const at::Tensor &lse_per_step, const at::Tensor &cu_seqlens_per_step,
                     int batch, int num_heads, int max_seqlen, int total_tokens, int num_sms = 108);
 
+at::Tensor cp_thd_read_half_tensor(const at::Tensor &input, const at::Tensor &cu_seqlens, int seq_dim, bool second_half);
+void out_correction_thd(at::Tensor &out, const at::Tensor &out_per_step, const at::Tensor &lse, const at::Tensor &lse_per_step,
+                        const at::Tensor &cu_seqlens);
+void out_correction_thd2(at::Tensor &out, const at::Tensor &out_per_step, const at::Tensor &lse, const at::Tensor &lse_per_step,
+                         const at::Tensor &cu_seqlens);
+at::Tensor cp_thd_bwd_lse(const at::Tensor &lse, const at::Tensor &cu_seqlens, int total_tokens);
+at::Tensor generate_thd_indices_for_cp(const at::Tensor &cu_seqlens, int total_tokens);
+void thd_op1(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int second_half, int add, int seq_dim);
+void thd_op2(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int add, int seq_dim);
