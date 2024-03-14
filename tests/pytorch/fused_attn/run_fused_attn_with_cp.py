@@ -31,7 +31,7 @@ def get_seq_idx(cu_seqlens, world_size, rank):
     seq_idx = torch.cat(seq_idx)
     return seq_idx.cuda()
 
-def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend='FlashAttention'):
+def run_dpa_with_cp(dtype='bf16', model='cp_1_0', qkv_format='bshd', kernel_backend='FlashAttention'):
     """Test DotProductAttention module with context parallelism"""
 
     os.environ["NVTE_FLASH_ATTN"] = "0"
@@ -62,6 +62,7 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
     cp_comm_group = dist.new_group(cp_comm_ranks, backend='nccl')
 
     config = model_configs[model]
+    # config.batch_size = 4
 
     assert config.attn_mask_type in ['causal', 'no_mask'], f"{config.attn_mask_type} is an unsupported attention mask type!"
 
@@ -88,8 +89,7 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         cu_seqlens_q = None
         cu_seqlens_kv = None
     else:
-        seqlens_q = torch.randint(world_size*2, config.max_seqlen_q*2, [config.batch_size]).to(torch.int32)
-        seqlens_q = seqlens_q - seqlens_q % (world_size * 2)
+        seqlens_q = torch.Tensor([config.max_seqlen_q] * config.batch_size).to(torch.int32)
         cu_seqlens_q = torch.cat([torch.zeros([1], dtype=torch.int32), seqlens_q.cumsum(0)])
         cu_seqlens_kv = cu_seqlens_q
         q_input_shape = (cu_seqlens_q[-1], config.num_heads, config.head_dim)
@@ -135,11 +135,76 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
     q_, k_, v_ = [x.requires_grad_() for x in [q_, k_, v_]]
     core_attn.set_context_parallel_group(cp_comm_group, cp_comm_ranks, torch.cuda.Stream())
 
-    if qkv_format == "bshd" or qkv_format == "sbhd":
-        out_ = core_attn(q_, k_, v_)
-    else:
-        out_ = core_attn(q_, k_, v_, cu_seqlens_q=cu_seqlens_q//world_size, cu_seqlens_kv=cu_seqlens_kv//world_size)
-    out_.backward(dout_)
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = cu_seqlens_q // world_size
+    if cu_seqlens_kv is not None:
+        cu_seqlens_kv = cu_seqlens_kv // world_size
+    max_seqlen_q = config.max_seqlen_q
+    max_seqlen_kv = config.max_seqlen_kv
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    torch.cuda.cudart().cudaProfilerStart()
+
+    # start.record()
+
+    n_iters = 100
+    n_warmups = 3
+    fwd_ts = []
+    bwd_ts = []
+    for i in range(n_iters):
+        torch.cuda.nvtx.range_push("iteration%d_rank%d"%(i, rank))
+
+        if i == n_warmups:
+            start.record()
+
+        torch.cuda.nvtx.range_push("forward")
+        if qkv_format == "bshd" or qkv_format == "sbhd":
+            out_ = core_attn(q_, k_, v_)
+        else:
+            out_ = core_attn(q_, k_, v_,
+                             cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+                             max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv)
+        torch.cuda.nvtx.range_pop()
+
+        """
+        if i >= n_warmups:
+            end.record()
+            end.synchronize()
+            fwd_ts.append(start.elapsed_time(end))
+            start.record()
+        """
+
+        torch.cuda.nvtx.range_push("backward")
+        out_.backward(dout_)
+        torch.cuda.nvtx.range_pop()
+
+        """
+        if i >= n_warmups:
+            end.record()
+            end.synchronize()
+            bwd_ts.append(start.elapsed_time(end))
+        """
+
+        if i < n_iters - 1:
+            torch.cuda.nvtx.range_push("zero_grad")
+            q_.grad[:] = 0
+            k_.grad[:] = 0
+            v_.grad[:] = 0
+            torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_pop()
+
+    torch.cuda.cudart().cudaProfilerStop()
+
+    end.record()
+    end.synchronize()
+    print(start.elapsed_time(end) / (n_iters - n_warmups))
+
+    # fwd_t = sum(fwd_ts) / len(fwd_ts)
+    # bwd_t = sum(bwd_ts) / len(bwd_ts)
+    # print(fwd_t, bwd_t, fwd_t + bwd_t)
 
     for x in [out_, q_.grad, k_.grad, v_.grad]:
         assert(torch.all(~torch.isnan(x)))
