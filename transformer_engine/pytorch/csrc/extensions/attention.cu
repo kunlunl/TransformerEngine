@@ -1394,8 +1394,10 @@ at::Tensor fa_prepare_bwd(at::Tensor q, at::Tensor k, at::Tensor v) {
     return qkv;
 }
 
-// -------------------------------------------------------------------------------------------------
-// binary search
+/***************************************************************************************************
+ * Binary search for supporting THD format in Context Parallel
+ **************************************************************************************************/
+
 __forceinline__
 __device__ int binary_search(int target, int *array, int len) {
   int left = 1, right = len - 1;
@@ -1410,11 +1412,13 @@ __device__ int binary_search(int target, int *array, int len) {
   return left - 1;
 }
 
-// -------------------------------------------------------------------------------------------------
-// softmax lse correction and reconstruction
+/***************************************************************************************************
+ * Softmax LSE related operations
+ **************************************************************************************************/
+
 template <typename lse_dtype, typename Functor>
-__global__ void LseCorrectionKernel(lse_dtype *lse, float *half_lse, int *cu_seqlens,
-                                    int batch, int num_heads, int max_seqlen) {
+__global__ void thd_lse_kernel(lse_dtype *lse, float *half_lse, int *cu_seqlens,
+                               int batch, int num_heads, int max_seqlen) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     cu_seqlens_s[i] = cu_seqlens[i] / 2;
@@ -1442,131 +1446,94 @@ __global__ void LseCorrectionKernel(lse_dtype *lse, float *half_lse, int *cu_seq
 
 struct LseCorrectionFunctor {
   __forceinline__
-  __device__ static void run(double *lse, float*half_lse, size_t idx, size_t half_idx) {
+  __device__ static void run(double *lse, float *half_lse, size_t idx, size_t half_idx) {
     double val = lse[idx];
     float val_per_step = half_lse[half_idx];
     lse[idx] = log(exp(val) + exp((double)val_per_step));
   }
 };
 
-void lse_correction(at::Tensor &lse, const at::Tensor &lse_per_step, const at::Tensor &cu_seqlens_per_step,
-                    int batch, int num_heads, int max_seqlen, int total_tokens, int num_sms) {
-  auto lse_type = lse.scalar_type();
-  auto lse_per_step_type = lse_per_step.scalar_type();
-  auto cu_seqlens_per_step_type = cu_seqlens_per_step.scalar_type();
-  NVTE_CHECK(lse_type == at::ScalarType::Double, "lse should be double");
-  NVTE_CHECK(lse_per_step_type == at::ScalarType::Float, "lse_per_step should be float");
-  NVTE_CHECK(cu_seqlens_per_step_type == at::ScalarType::Int, "cu_seqlens should be int");
+void thd_lse_correction(at::Tensor &lse,
+                        const at::Tensor &lse_per_step,
+                        const at::Tensor &cu_seqlens,
+                        int total_tokens) {
+  NVTE_CHECK(lse.scalar_type() == at::ScalarType::Double);
+  NVTE_CHECK(lse_per_step.scalar_type() == at::ScalarType::Float);
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+
+  NVTE_CHECK(lse.dim() == 3);
+  NVTE_CHECK(lse_per_step.dim() == 3);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
+
+  int batch      = lse.size(0);
+  int num_heads  = lse.size(1);
+  int max_seqlen = lse.size(2);
+
+  NVTE_CHECK(lse_per_step.size(0) == batch);
+  NVTE_CHECK(lse_per_step.size(1) == num_heads);
+  NVTE_CHECK(lse_per_step.size(2) == max_seqlen / 2);
+  NVTE_CHECK(cu_seqlens.size(0) == batch + 1);
+
   constexpr unsigned int block = 256;
   unsigned int grid_x = (total_tokens / 2 + block - 1) / block;
-  unsigned int grid_y = (num_sms * 2 + grid_x - 1) / grid_x;
-  dim3 grid = {grid_x, grid_y, 1};
-  LseCorrectionKernel<double, LseCorrectionFunctor><<<grid, block, (batch + 1) * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
-    (double*)lse.data_ptr(), (float*)lse_per_step.data_ptr(), (int*)cu_seqlens_per_step.data_ptr(), batch, num_heads, max_seqlen);
+  unsigned int grid_y = num_heads;
+  dim3 grid = {grid_x, grid_y};
+  thd_lse_kernel<double, LseCorrectionFunctor><<<grid, block, sizeof(int) * (batch+1),
+                                                 at::cuda::getCurrentCUDAStream()>>>(
+    lse.data_ptr<double>(),
+    lse_per_step.data_ptr<float>(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    num_heads,
+    max_seqlen);
 }
 
-struct THDBwdLseFunctor {
+struct GetLseFunctor {
   __forceinline__
-  __device__ static void run(float *lse, float*half_lse, size_t idx, size_t half_idx) {
+  __device__ static void run(float *lse, float *half_lse, size_t idx, size_t half_idx) {
     half_lse[half_idx] = lse[idx];
   }
 };
 
-at::Tensor cp_thd_bwd_lse(const at::Tensor &lse, const at::Tensor &cu_seqlens, int total_tokens) {
-  auto lse_type = lse.scalar_type();
-  auto cu_seqlens_type = cu_seqlens.scalar_type();
-  NVTE_CHECK(lse_type == at::ScalarType::Float, "lse should be float");
-  NVTE_CHECK(cu_seqlens_type == at::ScalarType::Int, "cu_seqlens should be int");
+at::Tensor thd_get_half_lse(const at::Tensor &lse,
+                            const at::Tensor &cu_seqlens,
+                            int total_tokens) {
+  NVTE_CHECK(lse.scalar_type() == at::ScalarType::Float);
+  NVTE_CHECK(lse.dim() == 3);
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
 
-  // Generate output
-  std::vector<int64_t> shape(lse.dim());
-  for (size_t i = 0; i < shape.size(); i++) {
-    shape[i] = lse.size(i);
-  }
-  shape[2] /= 2;
-  at::Tensor half_lse = at::zeros(shape, at::CUDA(lse.scalar_type()));
-
-  int batch = lse.size(0);
-  int num_heads = lse.size(1);
+  int batch      = lse.size(0);
+  int num_heads  = lse.size(1);
   int max_seqlen = lse.size(2);
+
+  NVTE_CHECK(cu_seqlens.size(0) == batch + 1);
+
+  std::vector<int64_t> shape = {batch, num_heads, max_seqlen / 2};
+  at::Tensor half_lse = at::zeros(shape, at::CUDA(lse.scalar_type()));
 
   constexpr unsigned int block = 256;
   unsigned int grid_x = (total_tokens / 2 + block - 1) / block;
-  unsigned int grid_y = (108 * 2 + grid_x - 1) / grid_x;
-  dim3 grid = {grid_x, grid_y, 1};
-  LseCorrectionKernel<float, THDBwdLseFunctor><<<grid, block, (batch + 1) * sizeof(int), at::cuda::getCurrentCUDAStream()>>>(
-    lse.data_ptr<float>(), half_lse.data_ptr<float>(), cu_seqlens.data_ptr<int>(), batch, num_heads, max_seqlen);
+  unsigned int grid_y = num_heads;
+  dim3 grid = {grid_x, grid_y};
+  thd_lse_kernel<float, GetLseFunctor><<<grid, block, sizeof(int) * (batch+1),
+                                         at::cuda::getCurrentCUDAStream()>>>(
+    lse.data_ptr<float>(),
+    half_lse.data_ptr<float>(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    num_heads,
+    max_seqlen);
 
   return half_lse;
 }
 
-// -------------------------------------------------------------------------------------------------
-// read_half_slice_thd
-template <int second_half>
-__global__ void cp_thd_read_half_tensor_kernel(void *half_tensor, void *tensor, int *cu_seqlens,
-                                               int cu_seqlens_size, int hidden_size_in_bytes) {
-  extern __shared__ int cu_seqlens_s[];
-  for (int i = threadIdx.x; i < cu_seqlens_size; i += blockDim.x) {
-    cu_seqlens_s[i] = cu_seqlens[i] / 2;
-  }
-  __syncthreads();
+/***************************************************************************************************
+ * Out correction
+ **************************************************************************************************/
 
-  int warpid = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-  int laneid = threadIdx.x % 32;
-  int num_warps = (blockDim.x * gridDim.x) / 32;
-  int num_total_tokens = cu_seqlens_s[cu_seqlens_size - 1];
-  int num_float4s_per_token = hidden_size_in_bytes / sizeof(float4);
-
-  size_t offset = num_total_tokens * (size_t)hidden_size_in_bytes;
-  half_tensor = (void*)((char*)half_tensor + offset * blockIdx.y);
-  tensor = (void*)((char*)tensor + 2 * offset * blockIdx.y);
-
-  for (int token_id = warpid; token_id < num_total_tokens; token_id += num_warps) {
-    int seqid = binary_search(token_id, cu_seqlens_s, cu_seqlens_size);
-    float4* cur_half_token = (float4*)((char*)half_tensor + token_id * (size_t)hidden_size_in_bytes);
-    float4* cur_token = (float4*)((char*)tensor + (token_id + cu_seqlens_s[seqid + second_half]) * (size_t)hidden_size_in_bytes);
-    for (int idx = laneid; idx < num_float4s_per_token; idx += 32) {
-      cur_half_token[idx] = cur_token[idx];
-    }
-  }
-}
-
-at::Tensor cp_thd_read_half_tensor(const at::Tensor &input, const at::Tensor &cu_seqlens, int seq_dim, bool second_half) {
-  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int, "cu_seqlens should be int");
-  size_t hidden_size_in_bytes = c10::elementSize(input.scalar_type()) * input.size(seq_dim + 1) * input.size(seq_dim + 2);
-  NVTE_CHECK(hidden_size_in_bytes % 16 == 0, "hidden_size_in_bytes % 16 should be 0");
-
-  // Generate output
-  std::vector<int64_t> shape(input.dim());
-  for (size_t i = 0; i < shape.size(); i++) {
-    shape[i] = input.size(i);
-  }
-  shape[seq_dim] /= 2;
-  at::Tensor output = at::empty(shape, at::CUDA(input.scalar_type()));
-
-  // Launch Kernel
-  constexpr unsigned int block = 256;
-  unsigned int grid_x = (input.size(seq_dim) / 2 * 32 + block - 1) / block;
-  unsigned int grid_y = 1;
-  if (seq_dim != 0) {
-    grid_y = input.size(0);
-  }
-  dim3 grid = {grid_x, grid_y};
-  if (second_half) {
-    cp_thd_read_half_tensor_kernel<1><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      (void*)output.data_ptr(), (void*)input.data_ptr(), (int*)cu_seqlens.data_ptr(), cu_seqlens.size(0), hidden_size_in_bytes);
-  } else {
-    cp_thd_read_half_tensor_kernel<0><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      (void*)output.data_ptr(), (void*)input.data_ptr(), (int*)cu_seqlens.data_ptr(), cu_seqlens.size(0), hidden_size_in_bytes);
-  }
-
-  return output;
-}
-
-// -------------------------------------------------------------------------------------------------
-// out_correction_thd
 template <typename dtype, int is_half, int tile_size>
-__global__ void out_correction_thd_kernel(dtype *out,
+__global__ void thd_out_correction_kernel(dtype *out,
                                           dtype *out_per_step,
                                           float *lse,
                                           float *lse_per_step,
@@ -1599,27 +1566,28 @@ __global__ void out_correction_thd_kernel(dtype *out,
       idx_per_step = (size_t)row * max_seqlen / (is_half + 1) + col;
       float lse_corrected_exp = exp(lse_per_step[idx_per_step] - lse[idx]);
 
-      idx = (((size_t)token_id + cu_seqlens_s[seq_id + 1] * is_half) * num_heads + head_id) * dim_per_head;
+      idx = (size_t)token_id + cu_seqlens_s[seq_id + 1] * is_half;
+      idx = (idx * num_heads + head_id) * dim_per_head;
       idx_per_step = ((size_t)token_id * num_heads + head_id) * dim_per_head;
       dtype *cur_out = out + idx;
       dtype *cur_out_per_step = out_per_step + idx_per_step;
 
       for (int j = lane_id; j < num_loops_per_head; j += tile_size) {
-        float4 tmp_out_per_step = ((float4*)cur_out_per_step)[j];
-        float4 tmp_out = ((float4*)cur_out)[j];
-        dtype *tmp_out_per_step_p = (dtype*)&tmp_out_per_step;
-        dtype *tmp_out_p = (dtype*)&tmp_out;
+        float4 data_per_step = ((float4*)cur_out_per_step)[j];
+        float4 data          = ((float4*)cur_out)[j];
+        dtype *p_per_step = (dtype*)&data_per_step;
+        dtype *p          = (dtype*)&data;
         for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
-          tmp_out_p[i] += tmp_out_per_step_p[i] * lse_corrected_exp;
+          p[i] += p_per_step[i] * lse_corrected_exp;
         }
-        ((float4*)cur_out)[j] = tmp_out;
+        ((float4*)cur_out)[j] = data;
       }
     }
   }
 }
 
 template<typename dtype, int is_half>
-void out_correction_thd_helper(at::Tensor &out,
+void thd_out_correction_helper(at::Tensor &out,
                                const at::Tensor &out_per_step,
                                const at::Tensor &lse,
                                const at::Tensor &lse_per_step,
@@ -1649,7 +1617,7 @@ void out_correction_thd_helper(at::Tensor &out,
   unsigned int grid_x = min((total_tokens / (is_half + 1) * tile + block - 1) / block, 256);
   dim3 grid = {grid_x, (unsigned int)num_heads};
 
-  out_correction_thd_kernel<dtype, is_half, tile><<<grid, block, sizeof(int) * (batch + 1),
+  thd_out_correction_kernel<dtype, is_half, tile><<<grid, block, sizeof(int) * (batch+1),
                                                     at::cuda::getCurrentCUDAStream()>>>(
     out.data_ptr<dtype>(),
     out_per_step.data_ptr<dtype>(),
@@ -1662,73 +1630,132 @@ void out_correction_thd_helper(at::Tensor &out,
     max_seqlen);
 }
 
-// Context parallel out correction for THD format
-void out_correction_thd(at::Tensor &out,
+void thd_out_correction(at::Tensor &out,
                         const at::Tensor &out_per_step,
                         const at::Tensor &lse,
                         const at::Tensor &lse_per_step,
                         const at::Tensor &cu_seqlens) {
   if (out.scalar_type() == at::ScalarType::Half) {
     using dtype = at::Half;
-    out_correction_thd_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else if (out.scalar_type() == at::ScalarType::BFloat16) {
     using dtype = at::BFloat16;
-    out_correction_thd_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else if (out.scalar_type() == at::ScalarType::Float) {
     using dtype = float;
-    out_correction_thd_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 0>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else {
     NVTE_ERROR("Unsupported dtype of out\n");
   }
 }
 
-// Context parallel out correction for THD format
-void out_correction_thd_half(at::Tensor &out,
+void thd_out_correction_half(at::Tensor &out,
                              const at::Tensor &out_per_step,
                              const at::Tensor &lse,
                              const at::Tensor &lse_per_step,
                              const at::Tensor &cu_seqlens) {
   if (out.scalar_type() == at::ScalarType::Half) {
     using dtype = at::Half;
-    out_correction_thd_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else if (out.scalar_type() == at::ScalarType::BFloat16) {
     using dtype = at::BFloat16;
-    out_correction_thd_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else if (out.scalar_type() == at::ScalarType::Float) {
     using dtype = float;
-    out_correction_thd_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
+    thd_out_correction_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
   } else {
     NVTE_ERROR("Unsupported dtype of out\n");
   }
 }
 
-// -------------------------------------------------------------------------------------------------
-// half_slice_thd
-template <typename dtype>
-struct AddFunctor {
-  __forceinline__
-  __device__ static void run(dtype *token, dtype *half_token, int idx) {
-    float4 tmp_half_token = ((float4*)half_token)[idx];
-    float4 tmp_token = ((float4*)token)[idx];
-    dtype *tmp_half_token_p = (dtype*)(&tmp_half_token);
-    dtype *tmp_token_p = (dtype*)(&tmp_token);
-    for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
-      tmp_token_p[i] += tmp_half_token_p[i];
+/***************************************************************************************************
+ * Read half of the q, dq, kv, dkv with THD format
+ **************************************************************************************************/
+
+__global__ void thd_get_half_tensor_kernel(void *half, void *tensor, int *cu_seqlens,
+                                           int batch, int hidden_size_in_bytes, int half_idx) {
+  extern __shared__ int cu_seqlens_s[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    cu_seqlens_s[i] = cu_seqlens[i] / 2;
+  }
+  __syncthreads();
+
+  int warpid = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  int laneid = threadIdx.x % 32;
+  int num_warps = (blockDim.x * gridDim.x) / 32;
+  int num_total_tokens = cu_seqlens_s[batch];
+  int num_float4s_per_token = hidden_size_in_bytes / sizeof(float4);
+
+  size_t offset = num_total_tokens * (size_t)hidden_size_in_bytes;
+  half = (void*)((char*)half + offset * blockIdx.y);
+  tensor = (void*)((char*)tensor + 2 * offset * blockIdx.y);
+
+  for (int token_id = warpid; token_id < num_total_tokens; token_id += num_warps) {
+    int seqid = binary_search(token_id, cu_seqlens_s, batch + 1);
+
+    size_t offset_in_bytes = (size_t)token_id * hidden_size_in_bytes;
+    float4* cur_half_token = (float4*)((char*)half + offset_in_bytes);
+
+    offset_in_bytes = ((size_t)token_id + cu_seqlens_s[seqid + half_idx]) * hidden_size_in_bytes;
+    float4* cur_token = (float4*)((char*)tensor + offset_in_bytes);
+
+    for (int idx = laneid; idx < num_float4s_per_token; idx += 32) {
+      cur_half_token[idx] = cur_token[idx];
     }
-    ((float4*)token)[idx] = tmp_token;
   }
-};
+}
 
-struct AssignFunctor {
-  __forceinline__
-  __device__ static void run(void *token, void *half_token, int idx) {
-    ((float4*)token)[idx] = ((float4*)half_token)[idx];
+at::Tensor thd_get_half_tensor(const at::Tensor &tensor,
+                               const at::Tensor &cu_seqlens,
+                               int seq_dim,
+                               int half_idx) {
+  NVTE_CHECK(tensor.dim() == (3 + seq_dim));
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
+  NVTE_CHECK(cu_seqlens.size(0) >= 2);
+
+  int batch = cu_seqlens.size(0) - 1;
+  int num_heads    = tensor.size(seq_dim + 1);
+  int dim_per_head = tensor.size(seq_dim + 2);
+  size_t hidden_size_in_bytes = num_heads * dim_per_head * c10::elementSize(tensor.scalar_type());
+
+  NVTE_CHECK(hidden_size_in_bytes % 16 == 0);
+
+  // Generate output
+  std::vector<int64_t> shape(tensor.dim());
+  for (size_t i = 0; i < shape.size(); i++) {
+    shape[i] = tensor.size(i);
   }
-};
+  shape[seq_dim] /= 2;
+  at::Tensor half = at::empty(shape, at::CUDA(tensor.scalar_type()));
 
-template <typename dtype, typename Functor, int second_half, int group_size>
-__global__ void thd_rw_half_kernel(dtype *whole, dtype *half_tensor, int *cu_seqlens,
-                                   int batch, int hidden_size) {
+  // Launch Kernel
+  constexpr unsigned int block = 256;
+  unsigned int grid_x = (tensor.size(seq_dim) / 2 * 32 + block - 1) / block;
+  unsigned int grid_y = 1;
+  for (int i = 0; i < seq_dim; i++) {
+    grid_y *= tensor.size(i);
+  }
+  dim3 grid = {grid_x, grid_y};
+  thd_get_half_tensor_kernel<<<grid, block, sizeof(int) * (batch+1),
+                               at::cuda::getCurrentCUDAStream()>>>(
+    half.data_ptr(),
+    tensor.data_ptr(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    hidden_size_in_bytes,
+    half_idx);
+
+  return half;
+}
+
+/***************************************************************************************************
+ * Elementwise operations for half of the dq and half of the dkv with THD format
+ **************************************************************************************************/
+
+template <typename dtype, typename Functor, int group_size>
+__global__ void thd_elementwise_half_kernel(dtype *whole, dtype *half, int *cu_seqlens,
+                                            int batch, int hidden_size, int half_idx) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     cu_seqlens_s[i] = cu_seqlens[i] / 2;
@@ -1741,73 +1768,134 @@ __global__ void thd_rw_half_kernel(dtype *whole, dtype *half_tensor, int *cu_seq
   int num_total_tokens = cu_seqlens_s[batch];
 
   size_t offset = num_total_tokens * (size_t)hidden_size;
-  half_tensor = half_tensor + offset * blockIdx.y;
+  half = half + offset * blockIdx.y;
   whole = whole + 2 * offset * blockIdx.y;
 
   int num_inner_loops = hidden_size * sizeof(dtype) / sizeof(float4);
 
   for (int token_id = group_id; token_id < num_total_tokens; token_id += num_groups) {
     int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
-    dtype *cur_half_token = half_tensor + token_id * (size_t)hidden_size;
-    dtype *cur_token = whole + (token_id + cu_seqlens_s[seq_id + second_half]) * (size_t)hidden_size;
+    dtype *cur_half_token = half + token_id * (size_t)hidden_size;
+    dtype *cur_token = whole + (token_id + cu_seqlens_s[seq_id + half_idx]) * (size_t)hidden_size;
     for (int idx = lane_id; idx < num_inner_loops; idx += group_size) {
       Functor::run(cur_token, cur_half_token, idx);
     }
   }
 }
 
-template <typename dtype>
-void helper(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int second_half, int add, int seq_dim) {
-  size_t hidden_size = whole.size(seq_dim + 1) * whole.size(seq_dim + 2);
-  NVTE_CHECK((hidden_size * c10::elementSize(whole.scalar_type())) % 16 == 0, "helper error");
+template <typename dtype, typename Functor>
+void thd_elementwise_half_helper(at::Tensor &whole,
+                                 const at::Tensor &half,
+                                 const at::Tensor &cu_seqlens,
+                                 int seq_dim,
+                                 int half_idx) {
+  NVTE_CHECK(whole.dim() == (seq_dim + 3));
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
 
-  // Launch Kernel
+  int total_tokens = whole.size(seq_dim);
+  int num_heads    = whole.size(seq_dim + 1);
+  int dim_per_head = whole.size(seq_dim + 2);
+  int batch = cu_seqlens.size(0) - 1;
+
+  NVTE_CHECK(half.size(seq_dim) == total_tokens / 2);
+  NVTE_CHECK(half.size(seq_dim + 1) == num_heads);
+  NVTE_CHECK(half.size(seq_dim + 2) == dim_per_head);
+
+  size_t hidden_size = num_heads * dim_per_head;
+  NVTE_CHECK((hidden_size * c10::elementSize(whole.scalar_type())) % 16 == 0);
+
   constexpr unsigned int block = 256;
-  unsigned int grid_x = (whole.size(seq_dim) / 2 * 32 + block - 1) / block;
+  unsigned int grid_x = (total_tokens / 2 * 32 + block - 1) / block;
   unsigned int grid_y = 1;
-  if (seq_dim != 0) {
-    grid_y = whole.size(0);
+  for (int i = 0; i < seq_dim; i++) {
+    grid_y *= whole.size(i);
   }
   dim3 grid = {grid_x, grid_y};
-
-  if (second_half == 0 && add == 0) {
-    thd_rw_half_kernel<dtype, AssignFunctor, 0, 32><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      whole.data_ptr<dtype>(), half.data_ptr<dtype>(), cu_seqlens.data_ptr<int>(), cu_seqlens.size(0) - 1, hidden_size);
-  } else if (second_half == 0 && add == 1) {
-    thd_rw_half_kernel<dtype, AddFunctor<dtype>, 0, 32><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      whole.data_ptr<dtype>(), half.data_ptr<dtype>(), cu_seqlens.data_ptr<int>(), cu_seqlens.size(0) - 1, hidden_size);
-  } else if (second_half == 1 && add == 0) {
-    thd_rw_half_kernel<dtype, AssignFunctor, 1, 32><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      whole.data_ptr<dtype>(), half.data_ptr<dtype>(), cu_seqlens.data_ptr<int>(), cu_seqlens.size(0) - 1, hidden_size);
-  } else if (second_half == 1 && add == 1) {
-    thd_rw_half_kernel<dtype, AddFunctor<dtype>, 1, 32><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-      whole.data_ptr<dtype>(), half.data_ptr<dtype>(), cu_seqlens.data_ptr<int>(), cu_seqlens.size(0) - 1, hidden_size);
-  } else {
-    NVTE_ERROR("thd_op1_helper Error\n");
-  }
+  thd_elementwise_half_kernel<dtype, Functor, 32><<<grid, block, sizeof(int) * (batch+1),
+                                                    at::cuda::getCurrentCUDAStream()>>>(
+    whole.data_ptr<dtype>(),
+    half.data_ptr<dtype>(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    hidden_size,
+    half_idx);
 }
 
-void thd_op1(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int second_half, int add, int seq_dim) {
-  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int, "cu_seqlens should be int");
+struct CopyFunctor {
+  __forceinline__
+  __device__ static void run(void *token, void *half_token, int idx) {
+    ((float4*)token)[idx] = ((float4*)half_token)[idx];
+  }
+};
 
+void thd_copy_half(at::Tensor &whole,
+                   const at::Tensor &half,
+                   const at::Tensor &cu_seqlens,
+                   int seq_dim,
+                   int half_idx) {
   if (whole.scalar_type() == at::ScalarType::Half) {
-    helper<at::Half>(whole, half, cu_seqlens, second_half, add, seq_dim);
+    using dtype = at::Half;
+    thd_elementwise_half_helper<dtype, CopyFunctor>(whole, half, cu_seqlens, seq_dim, half_idx);
   } else if (whole.scalar_type() == at::ScalarType::BFloat16) {
-    helper<at::BFloat16>(whole, half, cu_seqlens, second_half, add, seq_dim);
+    using dtype = at::BFloat16;
+    thd_elementwise_half_helper<dtype, CopyFunctor>(whole, half, cu_seqlens, seq_dim, half_idx);
   } else if (whole.scalar_type() == at::ScalarType::Float) {
-    helper<float>(whole, half, cu_seqlens, second_half, add, seq_dim);
+    using dtype = float;
+    thd_elementwise_half_helper<dtype, CopyFunctor>(whole, half, cu_seqlens, seq_dim, half_idx);
   } else {
-    NVTE_ERROR("thd_op1_error\n");
+    NVTE_ERROR("Unsupported dtype of whole\n");
   }
 }
 
-// -------------------------------------------------------------------------------------------------
-// slice_thd
-template <typename dtype, int left_add, int group_size>
-__global__ void thd_rw_half_kernel2(dtype *whole, dtype *t2, int *cu_seqlens,
-                                    int cu_seqlens_size, int hidden_size) {
+template <typename dtype>
+struct AddFunctor {
+  __forceinline__
+  __device__ static void run(dtype *token, dtype *half_token, int idx) {
+    float4 data_half = ((float4*)half_token)[idx];
+    float4 data      = ((float4*)token)[idx];
+
+    dtype *p_half = (dtype*)(&data_half);
+    dtype *p      = (dtype*)(&data);
+
+    for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
+      p[i] += p_half[i];
+    }
+    ((float4*)token)[idx] = data;
+  }
+};
+
+void thd_add_half(at::Tensor &whole,
+                  const at::Tensor &half,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim,
+                  int half_idx) {
+  if (whole.scalar_type() == at::ScalarType::Half) {
+    using dtype = at::Half;
+    using Functor = AddFunctor<at::Half>;
+    thd_elementwise_half_helper<dtype, Functor>(whole, half, cu_seqlens, seq_dim, half_idx);
+  } else if (whole.scalar_type() == at::ScalarType::BFloat16) {
+    using dtype = at::BFloat16;
+    using Functor = AddFunctor<at::BFloat16>;
+    thd_elementwise_half_helper<dtype, Functor>(whole, half, cu_seqlens, seq_dim, half_idx);
+  } else if (whole.scalar_type() == at::ScalarType::Float) {
+    using dtype = float;
+    using Functor = AddFunctor<float>;
+    thd_elementwise_half_helper<dtype, Functor>(whole, half, cu_seqlens, seq_dim, half_idx);
+  } else {
+    NVTE_ERROR("Unsupported dtype of whole\n");
+  }
+}
+
+/***************************************************************************************************
+ * Elementwise operations for dq and dkv with THD format
+ **************************************************************************************************/
+
+template <typename dtype, typename Functor_0, typename Functor_1, int group_size>
+__global__ void thd_elementwise_kernel(dtype *t1, dtype *t2, int *cu_seqlens,
+                                       int batch, int hidden_size) {
   extern __shared__ int cu_seqlens_s[];
-  for (int i = threadIdx.x; i < cu_seqlens_size; i += blockDim.x) {
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     cu_seqlens_s[i] = cu_seqlens[i];
   }
   __syncthreads();
@@ -1815,83 +1903,112 @@ __global__ void thd_rw_half_kernel2(dtype *whole, dtype *t2, int *cu_seqlens,
   int group_id = (blockIdx.x * blockDim.x + threadIdx.x) / group_size;
   int lane_id = threadIdx.x % group_size;
   int num_groups = (blockDim.x * gridDim.x) / group_size;
-  int num_total_tokens = cu_seqlens_s[cu_seqlens_size - 1];
+  int num_total_tokens = cu_seqlens_s[batch];
 
   size_t offset = num_total_tokens * (size_t)hidden_size;
   t2 = t2 + offset * blockIdx.y;
-  whole = whole + offset * blockIdx.y;
+  t1 = t1 + offset * blockIdx.y;
 
   int num_inner_loops = hidden_size * sizeof(dtype) / sizeof(float4);
 
   for (int token_id = group_id; token_id < num_total_tokens; token_id += num_groups) {
-    int seq_id = binary_search(token_id, cu_seqlens_s, cu_seqlens_size);
+    int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
     int len = cu_seqlens_s[seq_id + 1] - cu_seqlens_s[seq_id];
-    bool is_left = (token_id - cu_seqlens[seq_id]) < (len / 2);
+    int half_idx = (token_id - cu_seqlens[seq_id]) < (len / 2) ? 0 : 1;
 
     dtype *cur_half_token = t2 + token_id * (size_t)hidden_size;
-    dtype *cur_token = whole + token_id * (size_t)hidden_size;
+    dtype *cur_token = t1 + token_id * (size_t)hidden_size;
     for (int idx = lane_id; idx < num_inner_loops; idx += group_size) {
-      float4 tmp_half_token = ((float4*)cur_half_token)[idx];
-      float4 tmp_token;
-      if ((is_left && left_add == 1) || (!is_left && left_add == 0)) {
-        tmp_token = ((float4*)cur_token)[idx];
-        dtype *tmp_half_token_p = (dtype*)(&tmp_half_token);
-        dtype *tmp_token_p = (dtype*)(&tmp_token);
-        for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
-          tmp_token_p[i] += tmp_half_token_p[i];
-        }
+      if (half_idx == 0) {
+        Functor_0::run(cur_token, cur_half_token, idx);
       } else {
-        tmp_token = tmp_half_token;
+        Functor_1::run(cur_token, cur_half_token, idx);
       }
-      ((float4*)cur_token)[idx] = tmp_token;
     }
   }
 }
 
-template <typename dtype, int left_add>
-void thd_slice_add_helper(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int seq_dim) {
-  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int, "cu_seqlens should be int");
-  size_t hidden_size = whole.size(seq_dim + 1) * whole.size(seq_dim + 2);
-  NVTE_CHECK((hidden_size * c10::elementSize(whole.scalar_type())) % 16 == 0, "helper error");
+template <typename dtype, typename Functor_0, typename Functor_1>
+void thd_elementwise_helper(at::Tensor &t1,
+                            const at::Tensor &t2,
+                            const at::Tensor &cu_seqlens,
+                            int seq_dim) {
+  NVTE_CHECK(t1.dim() == (seq_dim + 3));
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
 
-  // Launch Kernel
+  int total_tokens = t1.size(seq_dim);
+  int num_heads    = t1.size(seq_dim + 1);
+  int dim_per_head = t1.size(seq_dim + 2);
+  int batch = cu_seqlens.size(0) - 1;
+
+  NVTE_CHECK(t2.size(seq_dim) == total_tokens);
+  NVTE_CHECK(t2.size(seq_dim + 1) == num_heads);
+  NVTE_CHECK(t2.size(seq_dim + 2) == dim_per_head);
+
+  size_t hidden_size = num_heads * dim_per_head;
+  NVTE_CHECK((hidden_size * c10::elementSize(t1.scalar_type())) % 16 == 0);
+
   constexpr unsigned int block = 256;
-  unsigned int grid_x = (whole.size(seq_dim) * 32 + block - 1) / block;
+  unsigned int grid_x = (total_tokens * 32 + block - 1) / block;
   unsigned int grid_y = 1;
-  if (seq_dim != 0) {
-    grid_y = whole.size(0);
+  for (int i = 0; i < seq_dim; i++) {
+    grid_y *= t1.size(i);
   }
   dim3 grid = {grid_x, grid_y};
 
-  thd_rw_half_kernel2<dtype, left_add, 32><<<grid, block, sizeof(int) * cu_seqlens.size(0), at::cuda::getCurrentCUDAStream()>>>(
-    whole.data_ptr<dtype>(), half.data_ptr<dtype>(), cu_seqlens.data_ptr<int>(), cu_seqlens.size(0), hidden_size);
+  thd_elementwise_kernel<dtype, Functor_0, Functor_1, 32><<<grid, block, sizeof(int) * (batch+1),
+                                                            at::cuda::getCurrentCUDAStream()>>>(
+    t1.data_ptr<dtype>(),
+    t2.data_ptr<dtype>(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    hidden_size);
 }
 
-void thd_first_half_add(at::Tensor &t1, const at::Tensor &t2, const at::Tensor &cu_seqlens, int seq_dim) {
+void thd_copy_add(at::Tensor &t1,
+                  const at::Tensor &t2,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim) {
   if (t1.scalar_type() == at::ScalarType::Half) {
     using dtype = at::Half;
-    thd_slice_add_helper<dtype, 1>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = CopyFunctor;
+    using Functor_1 = AddFunctor<at::Half>;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else if (t1.scalar_type() == at::ScalarType::BFloat16) {
     using dtype = at::BFloat16;
-    thd_slice_add_helper<dtype, 1>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = CopyFunctor;
+    using Functor_1 = AddFunctor<at::BFloat16>;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else if (t1.scalar_type() == at::ScalarType::Float) {
     using dtype = float;
-    thd_slice_add_helper<dtype, 1>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = CopyFunctor;
+    using Functor_1 = AddFunctor<float>;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else {
     NVTE_ERROR("Unsupported dtype of t1\n");
   }
 }
 
-void thd_second_half_add(at::Tensor &t1, const at::Tensor &t2, const at::Tensor &cu_seqlens, int seq_dim) {
+void thd_add_copy(at::Tensor &t1,
+                  const at::Tensor &t2,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim) {
   if (t1.scalar_type() == at::ScalarType::Half) {
     using dtype = at::Half;
-    thd_slice_add_helper<dtype, 0>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = AddFunctor<at::Half>;
+    using Functor_1 = CopyFunctor;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else if (t1.scalar_type() == at::ScalarType::BFloat16) {
     using dtype = at::BFloat16;
-    thd_slice_add_helper<dtype, 0>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = AddFunctor<at::BFloat16>;
+    using Functor_1 = CopyFunctor;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else if (t1.scalar_type() == at::ScalarType::Float) {
     using dtype = float;
-    thd_slice_add_helper<dtype, 0>(t1, t2, cu_seqlens, seq_dim);
+    using Functor_0 = AddFunctor<float>;
+    using Functor_1 = CopyFunctor;
+    thd_elementwise_helper<dtype, Functor_0, Functor_1>(t1, t2, cu_seqlens, seq_dim);
   } else {
     NVTE_ERROR("Unsupported dtype of t1\n");
   }

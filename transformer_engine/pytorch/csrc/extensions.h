@@ -559,45 +559,62 @@ void placeholder();
 
 
 /***************************************************************************************************
- * THD format for Context Parallel
+ * Support THD format in Context Parallel
  **************************************************************************************************/
 
-// thd_lse_correction
-void lse_correction(at::Tensor &lse, const at::Tensor &lse_per_step, const at::Tensor &cu_seqlens_per_step,
-                    int batch, int num_heads, int max_seqlen, int total_tokens, int num_sms = 108);
+void thd_lse_correction(at::Tensor &lse,
+                        const at::Tensor &lse_per_step,
+                        const at::Tensor &cu_seqlens,
+                        int total_tokens
+);
 
-// thd_read_half_lse
-at::Tensor cp_thd_bwd_lse(const at::Tensor &lse, const at::Tensor &cu_seqlens, int total_tokens);
+at::Tensor thd_get_half_lse(const at::Tensor &lse,
+                            const at::Tensor &cu_seqlens,
+                            int total_tokens
+);
 
-// thd_read_half_tensor
-at::Tensor cp_thd_read_half_tensor(const at::Tensor &input, const at::Tensor &cu_seqlens, int seq_dim, bool second_half);
-
-// thd_assign_half
-void thd_op1(at::Tensor &whole, const at::Tensor &half, const at::Tensor &cu_seqlens, int second_half, int add, int seq_dim);
-
-// thd_add_half
-
-// thd_out_correction
-void out_correction_thd(at::Tensor &out,
+void thd_out_correction(at::Tensor &out,
                         const at::Tensor &out_per_step,
                         const at::Tensor &lse,
                         const at::Tensor &lse_per_step,
-                        const at::Tensor &cu_seqlens);
-// thd_half_out_correction
-void out_correction_thd_half(at::Tensor &out,
+                        const at::Tensor &cu_seqlens
+);
+
+void thd_out_correction_half(at::Tensor &out,
                              const at::Tensor &out_per_step,
                              const at::Tensor &lse,
                              const at::Tensor &lse_per_step,
-                             const at::Tensor &cu_seqlens);
+                             const at::Tensor &cu_seqlens
+);
 
-// thd_add_assign
-void thd_first_half_add(at::Tensor &t1,
-                        const at::Tensor &t2,
-                        const at::Tensor &cu_seqlens,
-                        int seq_dim);
+at::Tensor thd_get_half_tensor(const at::Tensor &tensor,
+                               const at::Tensor &cu_seqlens,
+                               int seq_dim,
+                               int half_idx
+);
 
-// thd_assign_add
-void thd_second_half_add(at::Tensor &t1,
-                         const at::Tensor &t2,
-                         const at::Tensor &cu_seqlens,
-                         int seq_dim);
+void thd_copy_half(at::Tensor &whole,
+                   const at::Tensor &half,
+                   const at::Tensor &cu_seqlens,
+                   int seq_dim,
+                   int half_idx
+);
+
+void thd_add_half(at::Tensor &whole,
+                  const at::Tensor &half,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim,
+                  int half_idx
+);
+
+void thd_copy_add(at::Tensor &t1,
+                  const at::Tensor &t2,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim
+);
+
+void thd_add_copy(at::Tensor &t1,
+                  const at::Tensor &t2,
+                  const at::Tensor &cu_seqlens,
+                  int seq_dim
+);

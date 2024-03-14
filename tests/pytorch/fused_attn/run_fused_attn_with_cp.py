@@ -31,7 +31,7 @@ def get_seq_idx(cu_seqlens, world_size, rank):
     seq_idx = torch.cat(seq_idx)
     return seq_idx.cuda()
 
-def run_dpa_with_cp(dtype='bf16', model='cp_1_0', qkv_format='bshd', kernel_backend='FlashAttention'):
+def run_dpa_with_cp(dtype='bf16', model='cp_1_0', qkv_format='thd', kernel_backend='FlashAttention'):
     """Test DotProductAttention module with context parallelism"""
 
     os.environ["NVTE_FLASH_ATTN"] = "0"
@@ -62,7 +62,7 @@ def run_dpa_with_cp(dtype='bf16', model='cp_1_0', qkv_format='bshd', kernel_back
     cp_comm_group = dist.new_group(cp_comm_ranks, backend='nccl')
 
     config = model_configs[model]
-    # config.batch_size = 4
+    config.batch_size = 4
 
     assert config.attn_mask_type in ['causal', 'no_mask'], f"{config.attn_mask_type} is an unsupported attention mask type!"
 

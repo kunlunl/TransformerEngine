@@ -10,18 +10,6 @@
 #endif  // NVTE_WITH_USERBUFFERS
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  //CP Flash Attention THD
-  m.def("lse_correction", &lse_correction, "Lse Correction");
-  m.def("cp_thd_read_half_tensor", &cp_thd_read_half_tensor, "Read half tensor with THD format for Context Parallel");
-  m.def("cp_thd_bwd_lse", &cp_thd_bwd_lse, "cp_thd_bwd_lse");
-  m.def("thd_op1", &thd_op1, "thd_op1");
-
-  m.def("out_correction_thd", &out_correction_thd, "out_correction_thd");
-  m.def("out_correction_thd_half", &out_correction_thd_half, "out_correction_thd_half");
-
-  m.def("thd_first_half_add", &thd_first_half_add, "thd_first_half_add");
-  m.def("thd_second_half_add", &thd_second_half_add, "thd_second_half_add");
-
   // Softmax functions
   m.def("scaled_softmax_forward", &scaled_softmax_forward, "Scaled Softmax FWD");
   m.def("scaled_softmax_backward", &scaled_softmax_backward, "Scaled Softmax BWD");
@@ -97,6 +85,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("get_cublasLt_version", &get_cublasLt_version, "Get cublasLt version");
   m.def("get_cudnn_version", &get_cudnn_version, "Get cuDNN version");
   m.def("userbuf_comm_available", &userbuf_comm_available, "If userbuf backend is available");
+
+  // Support THD format in Context Parallel
+  m.def("thd_lse_correction", &thd_lse_correction, "Softmax LSE correction for THD format");
+  m.def("thd_get_half_lse", &thd_get_half_lse, "Get the half of the softmax LSE");
+  m.def("thd_out_correction", &thd_out_correction, "Out correction for THD format");
+  m.def("thd_out_correction_half", &thd_out_correction_half, "Correction of the half of the out");
+  m.def("thd_get_half_tensor", &thd_get_half_tensor, "Get the half of a THD tensor");
+  m.def("thd_copy_half", &thd_copy_half, "Copy the half of a THD tensor");
+  m.def("thd_add_half", &thd_add_half, "Inplace Add the half of a THD tensor");
+  m.def("thd_copy_add", &thd_copy_add, "Do copy/inplace_add on the first/second half respectively");
+  m.def("thd_add_copy", &thd_add_copy, "Do inplace_add/copy on the first/second half respectively");
 
   // Data structures
   py::class_<transformer_engine::FP8TensorMeta>(m, "FP8TensorMeta")
