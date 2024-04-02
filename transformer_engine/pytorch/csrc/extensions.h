@@ -699,3 +699,9 @@ void thd_add_copy(at::Tensor &t1,
                   const at::Tensor &cu_seqlens,
                   int seq_dim
 );
+
+at::Tensor thd_get_partitioned_indices(const at::Tensor &cu_seqlens,
+                                       int total_tokens,
+                                       int world_size,
+                                       int rank
+);
