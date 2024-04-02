@@ -6,30 +6,10 @@ import os, sys
 import torch
 import torch.distributed as dist
 from transformer_engine.pytorch.attention import DotProductAttention
+import transformer_engine_extensions as tex
 from test_fused_attn_with_cp import model_configs
 
 dtypes={'fp16' : torch.float16, 'bf16' : torch.bfloat16}
-
-def get_seq_idx(cu_seqlens, world_size, rank):
-    cu_seqlens = cu_seqlens.cpu()
-    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
-    seq_idx = []
-    for i in range(seqlens.shape[0]):
-        # The first half
-        left = cu_seqlens[i]
-        block_size = seqlens[i] // world_size // 2
-        left = left + rank * block_size
-        right = left + block_size
-        idx = torch.arange(left, right).to(torch.int32)
-        seq_idx.append(idx)
-        # The second half
-        right = cu_seqlens[i+1]
-        right = right - rank * block_size
-        left = right - block_size
-        idx = torch.arange(left, right).to(torch.int32)
-        seq_idx.append(idx)
-    seq_idx = torch.cat(seq_idx)
-    return seq_idx.cuda()
 
 def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend='FlashAttention'):
     """Test DotProductAttention module with context parallelism"""
@@ -128,8 +108,8 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         q_, k_, v_, dout_ = [x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim+2):]) for x in [q_, k_, v_, dout_]]
     else:
         q_, k_, v_, dout_ = [x.clone().detach() for x in [q, k, v, dout]]
-        seq_idx_q = get_seq_idx(cu_seqlens_q, world_size, rank)
-        seq_idx_kv = get_seq_idx(cu_seqlens_kv, world_size, rank)
+        seq_idx_q  = tex.thd_get_partitioned_indices(cu_seqlens_q, q_.size(0), world_size, rank)
+        seq_idx_kv = tex.thd_get_partitioned_indices(cu_seqlens_kv, k_.size(0), world_size, rank)
         q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
         k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
 

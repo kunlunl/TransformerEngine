@@ -107,6 +107,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("thd_add_half", &thd_add_half, "Inplace Add the half of a THD tensor");
   m.def("thd_copy_add", &thd_copy_add, "Do copy/inplace_add on the first/second half respectively");
   m.def("thd_add_copy", &thd_add_copy, "Do inplace_add/copy on the first/second half respectively");
+  m.def("thd_get_partitioned_indices",
+        &thd_get_partitioned_indices,
+        "Get partitioned indices for CP");
 
   // Data structures
   py::class_<transformer_engine::FP8TensorMeta>(m, "FP8TensorMeta")

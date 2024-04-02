@@ -2039,3 +2039,58 @@ void thd_add_copy(at::Tensor &t1,
     NVTE_ERROR("Unsupported dtype of t1\n");
   }
 }
+
+__global__ void thd_partition_indices_kernel(int *output,
+                                             int *cu_seqlens,
+                                             int batch,
+                                             int total_tokens,
+                                             int world_size,
+                                             int rank) {
+  extern __shared__ int cu_seqlens_s[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    cu_seqlens_s[i] = cu_seqlens[i] / world_size;
+  }
+  __syncthreads();
+
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int num_threads = blockDim.x * gridDim.x;
+
+  for (int token_id = tid; token_id < total_tokens / world_size; token_id += num_threads) {
+    int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
+    int seq_len = cu_seqlens_s[seq_id + 1] - cu_seqlens_s[seq_id];
+    int index = token_id - cu_seqlens_s[seq_id];
+    int offset = index < seq_len/2 ? rank : (world_size-1) * 2 - rank;
+    index += cu_seqlens_s[seq_id] * world_size + seq_len / 2 * offset;
+    output[token_id] = index;
+  }
+}
+
+at::Tensor thd_get_partitioned_indices(const at::Tensor &cu_seqlens,
+                                       int total_tokens,
+                                       int world_size,
+                                       int rank) {
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
+  NVTE_CHECK(cu_seqlens.size(0) >= 2);
+  NVTE_CHECK(rank >= 0 && rank < world_size);
+  NVTE_CHECK(world_size > 0);
+  NVTE_CHECK(total_tokens > 0 && total_tokens % (world_size * 2) == 0);
+
+  int batch = cu_seqlens.size(0) - 1;
+
+  std::vector<int64_t> shape = {total_tokens / world_size};
+  at::Tensor output = at::empty(shape, at::CUDA(at::ScalarType::Int));
+
+  constexpr unsigned int block = 256;
+  unsigned int grid = (output.size(0) + block - 1) / block;
+  thd_partition_indices_kernel<<<grid, block, sizeof(int) * (batch+1),
+                                 at::cuda::getCurrentCUDAStream()>>>(
+    output.data_ptr<int>(),
+    cu_seqlens.data_ptr<int>(),
+    batch,
+    total_tokens,
+    world_size,
+    rank);
+
+  return output;
+}
