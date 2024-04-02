@@ -1496,7 +1496,9 @@ struct LseCorrectionFunctor {
   __device__ static void run(double *lse, float *half_lse, size_t idx, size_t half_idx) {
     double val = lse[idx];
     float val_per_step = half_lse[half_idx];
-    lse[idx] = log(exp(val) + exp((double)val_per_step));
+    double max_scale = max(val, val_per_step);
+    double min_scale = min(val, val_per_step);
+    lse[idx] = max_scale + log(1.0 + exp(min_scale - max_scale));
   }
 };
 
