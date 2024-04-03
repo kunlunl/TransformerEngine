@@ -31,7 +31,7 @@ def get_bash_arguments(**kwargs):
 @pytest.mark.skipif(not _is_flash_attention_2_available(), reason="Flash-attn 2.0+ is required.")
 @pytest.mark.parametrize("dtype", ['bf16', 'fp16'])
 @pytest.mark.parametrize("model", model_configs.keys())
-@pytest.mark.parametrize("qkv_format", ['bshd', 'sbhd'])
+@pytest.mark.parametrize("qkv_format", ['bshd', 'sbhd', 'thd'])
 def test_cp_with_flash_attention(dtype, model, qkv_format):
     subprocess.run(
         get_bash_arguments(
