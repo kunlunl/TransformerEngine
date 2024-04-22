@@ -624,7 +624,8 @@ class AttnFuncWithCP(torch.autograd.Function):
                                 q_inputs[i%2] = q.view(-1, *q.shape[-2:])
                                 if thd:
                                     # [2, t, np, hn] -> [2, t/2, np, hn]
-                                    kv_inputs[i%2] = tex.thd_read_half_tensor(kv_inputs[i%2], cu_seqlens_k, 0)
+                                    kv_inputs[i%2] = tex.thd_read_half_tensor(
+                                        kv_inputs[i%2], cu_seqlens_k, 0)
                                 else:
                                     # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn]
                                     kv_inputs[i%2] = kv_inputs[i%2][:, :, 0, ...].contiguous()
@@ -660,8 +661,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                                     # [t, np, hn] -> [t/2, np, hn]
                                     q_inputs[i%2] = tex.thd_read_half_tensor(q, cu_seqlens_q, 1)
                                 else:
-                                    # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
-                                    q_inputs[i%2] = q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
+                                    # [b, 2, sq//2, np, hn]->[b, sq//2, np, hn]->[b*sq//2, np, hn]
+                                    q_inputs[i%2] = \
+                                        q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
                                 # [2, b, 2, sk//2, np, hn] -> [2, b*sk, np, hn]
                                 kv_inputs[i%2] = kv_inputs[i%2].view(2, -1, *k.shape[-2:])
                                 if _flash_attn_2_3_plus:
@@ -720,10 +722,10 @@ class AttnFuncWithCP(torch.autograd.Function):
                                                               softmax_lse_per_step[i-1])
                     else:
                         if thd:
-                            tex.thd_lse_correction(softmax_lse,
-                                                   softmax_lse_per_step[i-1],
-                                                   cu_seqlens_q,
-                                                   q.size(0))
+                            tex.thd_second_half_lse_correction(softmax_lse,
+                                                               softmax_lse_per_step[i-1],
+                                                               cu_seqlens_q,
+                                                               q.size(0))
                         else:
                             flash_attn_fwd_softmax_lse_correction(softmax_lse_[..., 1, :],
                                                                   softmax_lse_per_step[i-1])
@@ -801,10 +803,11 @@ class AttnFuncWithCP(torch.autograd.Function):
 
         if ctx.causal:
             if ctx.thd:
-                softmax_lse_ = tex.thd_read_half_lse(softmax_lse, cu_seqlens_q, q.size(0))
+                softmax_lse_ = tex.thd_read_second_half_lse(softmax_lse, cu_seqlens_q, q.size(0))
             else:
                 # [b, np, sq] -> [b, np, 2, sq//2]
-                softmax_lse_ = softmax_lse.view(*softmax_lse.shape[:-1], 2, softmax_lse.shape[-1]//2)
+                softmax_lse_ = \
+                    softmax_lse.view(*softmax_lse.shape[:-1], 2, softmax_lse.shape[-1]//2)
                 softmax_lse_ = softmax_lse_[..., 1, :].contiguous()
                 if ctx.use_fused_attention:
                     # [b, np, sq//2] -> [b, np, sq//2, 1]
@@ -922,7 +925,7 @@ class AttnFuncWithCP(torch.autograd.Function):
                             # [2, t, np, hn] -> [2, t/2, np, hn]
                             kv_ = tex.thd_read_half_tensor(kv, cu_seqlens_k, 0)
                         else:
-                            # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn] -> [2, b*sk//2, np, hn]
+                            # [2, b, 2, sk//2, np, hn]->[2, b, sk//2, np, hn]->[2, b*sk//2, np, hn]
                             kv_ = kv[:, :, 0, ...].contiguous().view(2, -1, *kv.shape[-2:])
                         dkv_ = torch.empty_like(kv_)
                         # [b, 2, sq//2, np, hn] -> [b*sq, np, hn]

@@ -67,8 +67,7 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         attn_output_shape = (config.max_seqlen_q, config.batch_size, config.num_heads*config.head_dim)
         cu_seqlens_q = None
         cu_seqlens_kv = None
-    else:
-        assert(config.max_seqlen_q % (world_size * 2) == 0)
+    elif qkv_format == "thd":
         seqlens_q = torch.randint(world_size * 2, config.max_seqlen_q + 1, [config.batch_size]).to(torch.int32)
         seqlens_q = seqlens_q - seqlens_q % (world_size * 2)
         cu_seqlens_q = torch.cat([torch.zeros([1], dtype=torch.int32), seqlens_q.cumsum(0)])
@@ -78,6 +77,8 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         attn_output_shape = (cu_seqlens_q[-1], config.num_heads*config.head_dim)
         cu_seqlens_q = cu_seqlens_q.to(torch.int32).cuda()
         cu_seqlens_kv = cu_seqlens_kv.to(torch.int32).cuda()
+    else:
+        assert False, f"{qkv_format} is an unsupported qkv_format!"
 
     q = torch.randn(q_input_shape, dtype=dtypes[dtype]).cuda()
     k = torch.randn(kv_input_shape, dtype=dtypes[dtype]).cuda()
@@ -94,7 +95,7 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
     # run core_attn without CP
     for x in [q, k, v]:
         x.requires_grad = True
-    out = core_attn(q, k, v, cu_seqlens_q = cu_seqlens_q, cu_seqlens_kv = cu_seqlens_kv)
+    out = core_attn(q, k, v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
     out.backward(dout)
 
     # run core_attn wit CP
@@ -106,20 +107,21 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         seq_idx = torch.tensor([rank, 2*world_size-rank-1], device=q_.device)
         q_, k_, v_, dout_ = [x.index_select(seq_dim, seq_idx) for x in [q_, k_, v_, dout_]]
         q_, k_, v_, dout_ = [x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim+2):]) for x in [q_, k_, v_, dout_]]
-    else:
+    elif qkv_format == "thd":
         q_, k_, v_, dout_ = [x.clone().detach() for x in [q, k, v, dout]]
         seq_idx_q  = tex.thd_get_partitioned_indices(cu_seqlens_q, q_.size(0), world_size, rank)
         seq_idx_kv = tex.thd_get_partitioned_indices(cu_seqlens_kv, k_.size(0), world_size, rank)
         q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
         k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
+        cu_seqlens_q = cu_seqlens_q // world_size
+        cu_seqlens_kv = cu_seqlens_kv // world_size
+    else:
+        assert False, f"{qkv_format} is an unsupported qkv_format!"
 
     q_, k_, v_ = [x.requires_grad_() for x in [q_, k_, v_]]
     core_attn.set_context_parallel_group(cp_comm_group, cp_comm_ranks, torch.cuda.Stream())
 
-    if qkv_format == "bshd" or qkv_format == "sbhd":
-        out_ = core_attn(q_, k_, v_)
-    else:
-        out_ = core_attn(q_, k_, v_, cu_seqlens_q=cu_seqlens_q//world_size, cu_seqlens_kv=cu_seqlens_kv//world_size)
+    out_ = core_attn(q_, k_, v_, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
     out_.backward(dout_)
 
     for x in [out_, q_.grad, k_.grad, v_.grad]:
@@ -137,10 +139,12 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         dq, dk, dv, out = [x.index_select(seq_dim, seq_idx) for x in [dq, dk, dv, out]]
         dq_, dk_, dv_, out_ = [x.view(*x.shape[:seq_dim], 2, x.shape[seq_dim]//2, *x.shape[(seq_dim+1):]) \
             for x in [q_.grad, k_.grad, v_.grad, out_]]
-    else:
+    elif qkv_format == "thd":
         dq, out = [x.index_select(0, seq_idx_q).contiguous().view(-1) for x in [q.grad, out]]
         dk, dv = [x.index_select(0, seq_idx_kv).contiguous().view(-1) for x in [k.grad, v.grad]]
         dq_, dk_, dv_, out_ = [x.view(-1) for x in [q_.grad, k_.grad, v_.grad, out_]]
+    else:
+        assert False, f"{qkv_format} is an unsupported qkv_format!"
 
     if qkv_format == "bshd":
         torch.testing.assert_close(out_[:, 0], out[:, 0], **tols)
@@ -160,11 +164,13 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         torch.testing.assert_close(dq_[1], dq[1], **tols)
         torch.testing.assert_close(dk_[1], dk[1], **tols)
         torch.testing.assert_close(dv_[1], dv[1], **tols)
-    else:
+    elif qkv_format == "thd":
         torch.testing.assert_close(out_, out, **tols)
         torch.testing.assert_close(dq_, dq, **tols)
         torch.testing.assert_close(dk_, dk, **tols)
         torch.testing.assert_close(dv_, dv, **tols)
+    else:
+        assert False, f"{qkv_format} is an unsupported qkv_format!"
 
 def main(**kwargs):
     run_dpa_with_cp(**kwargs)

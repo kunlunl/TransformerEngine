@@ -1463,8 +1463,13 @@ __device__ int binary_search(int target, int *array, int len) {
  * Support THD format for Context Parallel: Read the half of a THD tensor
  **************************************************************************************************/
 
-__global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_seqlens,
-                                            int batch, int hidden_size_in_bytes, int half_idx) {
+__global__ void thd_read_half_tensor_kernel(void *half,
+                                            void *tensor,
+                                            int *cu_seqlens,
+                                            int batch,
+                                            int hidden_size_in_bytes,
+                                            int half_idx,
+                                            int dim_size_of_token) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     cu_seqlens_s[i] = cu_seqlens[i] / 2;
@@ -1477,9 +1482,9 @@ __global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_se
   int num_total_tokens = cu_seqlens_s[batch];
   int num_float4s_per_token = hidden_size_in_bytes / sizeof(float4);
 
-  size_t offset = num_total_tokens * (size_t)hidden_size_in_bytes;
-  half = (void*)((char*)half + offset * blockIdx.y);
-  tensor = (void*)((char*)tensor + 2 * offset * blockIdx.y);
+  size_t offset = (size_t)dim_size_of_token * hidden_size_in_bytes;
+  half = (void*)((char*)half + offset/2 * blockIdx.y);
+  tensor = (void*)((char*)tensor + offset * blockIdx.y);
 
   for (int token_id = warpid; token_id < num_total_tokens; token_id += num_warps) {
     int seqid = binary_search(token_id, cu_seqlens_s, batch + 1);
@@ -1511,8 +1516,9 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor,
   int batch = cu_seqlens.size(0) - 1;
   int num_heads    = tensor.size(seq_dim + 1);
   int dim_per_head = tensor.size(seq_dim + 2);
-  size_t hidden_size_in_bytes = num_heads * dim_per_head * c10::elementSize(tensor.scalar_type());
+  int hidden_size_in_bytes = num_heads * dim_per_head * c10::elementSize(tensor.scalar_type());
 
+  // For 128-bits load/store
   NVTE_CHECK(hidden_size_in_bytes % 16 == 0);
 
   // Generate output
@@ -1538,7 +1544,8 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor,
     cu_seqlens.data_ptr<int>(),
     batch,
     hidden_size_in_bytes,
-    half_idx);
+    half_idx,
+    tensor.size(seq_dim));
 
   return half;
 }
@@ -1563,12 +1570,12 @@ __global__ void thd_lse_kernel(lse_dtype *lse, float *half_lse, int *cu_seqlens,
   for (int token_id = tid; token_id < num_total_tokens; token_id += num_threads) {
     int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
     for (int head_id = blockIdx.y; head_id < num_heads; head_id += gridDim.y) {
-      int row = seq_id * num_heads + head_id;
+      size_t row = (size_t)seq_id * num_heads + head_id;
       int col = token_id - cu_seqlens_s[seq_id];
       int seq_len = cu_seqlens_s[seq_id + 1] - cu_seqlens_s[seq_id];
 
-      size_t idx = (size_t)row * max_seqlen + col + seq_len;
-      size_t half_idx = (size_t)row * max_seqlen / 2 + col;
+      size_t idx = row * max_seqlen + col + seq_len;
+      size_t half_idx = row * max_seqlen / 2 + col;
 
       Functor::run(lse, half_lse, idx, half_idx);
     }
@@ -1586,10 +1593,10 @@ struct LseCorrectionFunctor {
   }
 };
 
-void thd_lse_correction(at::Tensor &lse,
-                        const at::Tensor &lse_per_step,
-                        const at::Tensor &cu_seqlens,
-                        int total_tokens) {
+void thd_second_half_lse_correction(at::Tensor &lse,
+                                    const at::Tensor &lse_per_step,
+                                    const at::Tensor &cu_seqlens,
+                                    int total_tokens) {
   NVTE_CHECK(lse.scalar_type() == at::ScalarType::Double);
   NVTE_CHECK(lse_per_step.scalar_type() == at::ScalarType::Float);
   NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
@@ -1628,9 +1635,9 @@ struct ReadLseFunctor {
   }
 };
 
-at::Tensor thd_read_half_lse(const at::Tensor &lse,
-                             const at::Tensor &cu_seqlens,
-                             int total_tokens) {
+at::Tensor thd_read_second_half_lse(const at::Tensor &lse,
+                                    const at::Tensor &cu_seqlens,
+                                    int total_tokens) {
   NVTE_CHECK(lse.scalar_type() == at::ScalarType::Float);
   NVTE_CHECK(lse.dim() == 3);
   NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
@@ -1665,7 +1672,7 @@ at::Tensor thd_read_half_lse(const at::Tensor &lse,
  * Support THD format for Context Parallel: Out correction in forward
  **************************************************************************************************/
 
-template <typename dtype, int is_half, int tile_size>
+template <typename dtype, int only_second_half, int tile_size>
 __global__ void thd_out_correction_kernel(dtype *out,
                                           dtype *out_per_step,
                                           float *lse,
@@ -1677,7 +1684,7 @@ __global__ void thd_out_correction_kernel(dtype *out,
                                           int max_seqlen) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
-    cu_seqlens_s[i] = cu_seqlens[i] / (is_half + 1);
+    cu_seqlens_s[i] = cu_seqlens[i] / (only_second_half + 1);
   }
   __syncthreads();
 
@@ -1692,14 +1699,14 @@ __global__ void thd_out_correction_kernel(dtype *out,
     for (int head_id = blockIdx.y; head_id < num_heads; head_id += gridDim.y) {
       size_t idx, idx_per_step;
 
-      int row = seq_id * num_heads + head_id;
+      size_t row = (size_t)seq_id * num_heads + head_id;
       int col = token_id - cu_seqlens_s[seq_id];
       int seq_len = cu_seqlens_s[seq_id + 1] - cu_seqlens_s[seq_id];
-      idx = (size_t)row * max_seqlen + col + seq_len * is_half;
-      idx_per_step = (size_t)row * max_seqlen / (is_half + 1) + col;
+      idx = row * max_seqlen + col + seq_len * only_second_half;
+      idx_per_step = row * max_seqlen / (only_second_half + 1) + col;
       float lse_corrected_exp = exp(lse_per_step[idx_per_step] - lse[idx]);
 
-      idx = (size_t)token_id + cu_seqlens_s[seq_id + 1] * is_half;
+      idx = token_id + cu_seqlens_s[seq_id + 1] * only_second_half;
       idx = (idx * num_heads + head_id) * dim_per_head;
       idx_per_step = ((size_t)token_id * num_heads + head_id) * dim_per_head;
       dtype *cur_out = out + idx;
@@ -1710,8 +1717,8 @@ __global__ void thd_out_correction_kernel(dtype *out,
         float4 data          = ((float4*)cur_out)[j];
         dtype *p_per_step = (dtype*)&data_per_step;
         dtype *p          = (dtype*)&data;
-        for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
-          p[i] += p_per_step[i] * lse_corrected_exp;
+        for (int k = 0; k < sizeof(float4) / sizeof(dtype); k++) {
+          p[k] += p_per_step[k] * lse_corrected_exp;
         }
         ((float4*)cur_out)[j] = data;
       }
@@ -1719,7 +1726,7 @@ __global__ void thd_out_correction_kernel(dtype *out,
   }
 }
 
-template<typename dtype, int is_half>
+template<typename dtype, int only_second_half>
 static void thd_out_correction_helper(at::Tensor &out,
                                       const at::Tensor &out_per_step,
                                       const at::Tensor &lse,
@@ -1736,22 +1743,22 @@ static void thd_out_correction_helper(at::Tensor &out,
   int batch      = lse.size(0);
   int max_seqlen = lse.size(2);
 
-  NVTE_CHECK(out_per_step.size(0) == total_tokens / (is_half + 1));
+  NVTE_CHECK(out_per_step.size(0) == total_tokens / (only_second_half + 1));
   NVTE_CHECK(out_per_step.size(1) == num_heads);
   NVTE_CHECK(out_per_step.size(2) == dim_per_head);
   NVTE_CHECK(lse.size(1) == num_heads);
   NVTE_CHECK(lse_per_step.size(0) == batch);
   NVTE_CHECK(lse_per_step.size(1) == num_heads);
-  NVTE_CHECK(lse_per_step.size(2) == max_seqlen / (is_half + 1));
+  NVTE_CHECK(lse_per_step.size(2) == max_seqlen / (only_second_half + 1));
   NVTE_CHECK(cu_seqlens.size(0) == batch + 1);
 
   constexpr int tile = 16;
   constexpr int block = 512;
-  unsigned int grid_x = min((total_tokens / (is_half + 1) * tile + block - 1) / block, 256);
+  unsigned int grid_x = ((size_t)total_tokens / (only_second_half + 1) * tile + block - 1) / block;
   dim3 grid = {grid_x, (unsigned int)num_heads};
 
-  thd_out_correction_kernel<dtype, is_half, tile><<<grid, block, sizeof(int) * (batch+1),
-                                                    at::cuda::getCurrentCUDAStream()>>>(
+  thd_out_correction_kernel<dtype, only_second_half, tile><<<grid, block, sizeof(int) * (batch+1),
+                                                             at::cuda::getCurrentCUDAStream()>>>(
     out.data_ptr<dtype>(),
     out_per_step.data_ptr<dtype>(),
     lse.data_ptr<float>(),
@@ -1768,8 +1775,8 @@ void thd_out_correction(at::Tensor &out,
                         const at::Tensor &lse,
                         const at::Tensor &lse_per_step,
                         const at::Tensor &cu_seqlens,
-                        bool is_half) {
-  if (is_half) {
+                        bool only_second_half) {
+  if (only_second_half) {
     if (out.scalar_type() == at::ScalarType::Half) {
       using dtype = at::Half;
       thd_out_correction_helper<dtype, 1>(out, out_per_step, lse, lse_per_step, cu_seqlens);
@@ -1803,8 +1810,12 @@ void thd_out_correction(at::Tensor &out,
  **************************************************************************************************/
 
 template <typename dtype, typename Functor_0, typename Functor_1, int functor_idx, int group_size>
-__global__ void thd_grad_correction_kernel(dtype *grad, dtype *grad_per_step, int *cu_seqlens,
-                                           int batch, int hidden_size) {
+__global__ void thd_grad_correction_kernel(dtype *grad,
+                                           dtype *grad_per_step,
+                                           int *cu_seqlens,
+                                           int batch,
+                                           int hidden_size,
+                                           int dim_size_of_token) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     if constexpr (functor_idx < 2) {
@@ -1821,13 +1832,13 @@ __global__ void thd_grad_correction_kernel(dtype *grad, dtype *grad_per_step, in
   int num_total_tokens = cu_seqlens_s[batch];
   int num_inner_loops = hidden_size * sizeof(dtype) / sizeof(float4);
 
-  size_t offset = num_total_tokens * (size_t)hidden_size;
-  grad_per_step = grad_per_step + offset * blockIdx.y;
+  size_t offset = (size_t)dim_size_of_token * hidden_size;
   if constexpr (functor_idx < 2) {
-    grad = grad + offset * blockIdx.y * 2;
+    grad_per_step = grad_per_step + offset / 2 * blockIdx.y;
   } else {
-    grad = grad + offset * blockIdx.y;
+    grad_per_step = grad_per_step + offset * blockIdx.y;
   }
+  grad = grad + offset * blockIdx.y;
 
   for (int token_id = group_id; token_id < num_total_tokens; token_id += num_groups) {
     int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
@@ -1857,8 +1868,7 @@ __global__ void thd_grad_correction_kernel(dtype *grad, dtype *grad_per_step, in
 
 struct EmptyFunctor {
   __forceinline__
-  __device__ static void run(void *token, void *token_per_step, int idx) {
-  }
+  __device__ static void run(void *token, void *token_per_step, int idx) {}
 };
 
 struct CopyFunctor {
@@ -1872,14 +1882,18 @@ template <typename dtype>
 struct AddFunctor {
   __forceinline__
   __device__ static void run(dtype *token, dtype *token_per_step, int idx) {
-    float4 d = ((float4*)token)[idx];
-    dtype *p = (dtype*)(&d);
-    float4 d_ = ((float4*)token_per_step)[idx];
+    float4 d_ = ((float4*)token)[idx];
     dtype *p_ = (dtype*)(&d_);
+
+    float4 d = ((float4*)token_per_step)[idx];
+    dtype *p = (dtype*)(&d);
+
+    #pragma unroll
     for (int i = 0; i < sizeof(float4) / sizeof(dtype); i++) {
-      p[i] += p_[i];
+      p_[i] += p[i];
     }
-    ((float4*)token)[idx] = d;
+
+    ((float4*)token)[idx] = d_;
   }
 };
 
@@ -1930,7 +1944,8 @@ static void thd_grad_correction_helper(at::Tensor &grad,
       grad_per_step.data_ptr<dtype>(),
       cu_seqlens.data_ptr<int>(),
       batch,
-      hidden_size);
+      hidden_size,
+      total_tokens);
 }
 
 template <typename dtype>
@@ -1990,7 +2005,11 @@ __global__ void thd_partition_indices_kernel(int *output,
                                              int rank) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
-    cu_seqlens_s[i] = cu_seqlens[i] / world_size;
+    int seqlen = cu_seqlens[i];
+    // Currently we assume that each sequence length is divisible by (world_size*2) since we have
+    // to distribute each sequence evenly to different GPUs.
+    assert(seqlen % (world_size*2) == 0);
+    cu_seqlens_s[i] = seqlen / world_size;
   }
   __syncthreads();
 

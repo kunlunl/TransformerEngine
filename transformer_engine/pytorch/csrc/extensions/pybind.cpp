@@ -103,14 +103,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("userbuf_comm_available", &userbuf_comm_available, "If userbuf backend is available");
 
   // Support THD format for Context Parallel
-  m.def("thd_read_half_tensor", &thd_read_half_tensor, "Read the half of a THD tensor");
-  m.def("thd_lse_correction", &thd_lse_correction, "softmax_lse correction for THD format");
-  m.def("thd_read_half_lse", &thd_read_half_lse, "Read the half of the softmax_lse");
-  m.def("thd_out_correction", &thd_out_correction, "Out correction for THD format");
-  m.def("thd_grad_correction", &thd_grad_correction, "Gradients correction for THD format");
-  m.def("thd_get_partitioned_indices",
-        &thd_get_partitioned_indices,
-        "Generate partitioned indices for input tokens");
+  m.def("thd_read_half_tensor", &thd_read_half_tensor,
+        "Read the first half(half_idx=0) or the second half(half_idx=1) of each sequence in a THD "
+        "tensor");
+  m.def("thd_second_half_lse_correction", &thd_second_half_lse_correction,
+        "Correct the second half of the softmax_lse");
+  m.def("thd_read_second_half_lse", &thd_read_second_half_lse,
+        "Read the second half of the softmax_lse");
+  m.def("thd_out_correction", &thd_out_correction,
+        "Correct the THD format output of context parallelism in forward pass");
+  m.def("thd_grad_correction", &thd_grad_correction,
+        "Correct the THD format gradients of context parallelism in backward pass");
+  m.def("thd_get_partitioned_indices", &thd_get_partitioned_indices,
+        "Generate partitioned indices for inputs in THD format");
 
   // Data structures
   py::class_<transformer_engine::FP8TensorMeta>(m, "FP8TensorMeta")

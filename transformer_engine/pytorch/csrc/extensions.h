@@ -648,15 +648,15 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor,
                                 int half_idx
 );
 
-void thd_lse_correction(at::Tensor &lse,
-                        const at::Tensor &lse_per_step,
-                        const at::Tensor &cu_seqlens,
-                        int total_tokens
+void thd_second_half_lse_correction(at::Tensor &lse,
+                                    const at::Tensor &lse_per_step,
+                                    const at::Tensor &cu_seqlens,
+                                    int total_tokens
 );
 
-at::Tensor thd_read_half_lse(const at::Tensor &lse,
-                             const at::Tensor &cu_seqlens,
-                             int total_tokens
+at::Tensor thd_read_second_half_lse(const at::Tensor &lse,
+                                    const at::Tensor &cu_seqlens,
+                                    int total_tokens
 );
 
 void thd_out_correction(at::Tensor &out,
@@ -664,7 +664,7 @@ void thd_out_correction(at::Tensor &out,
                         const at::Tensor &lse,
                         const at::Tensor &lse_per_step,
                         const at::Tensor &cu_seqlens,
-                        bool is_half
+                        bool only_second_half
 );
 
 void thd_grad_correction(at::Tensor &grad,
