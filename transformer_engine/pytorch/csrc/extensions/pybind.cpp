@@ -103,9 +103,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("thd_read_half_lse", &thd_read_half_lse, "Read the half of the softmax_lse");
   m.def("thd_out_correction", &thd_out_correction, "Out correction for THD format");
   m.def("thd_grad_correction", &thd_grad_correction, "Gradients correction for THD format");
+  m.def("thd_padding", &thd_padding, "Padding a THD tensor when it's not divisible by cp*2");
   m.def("thd_get_partitioned_indices",
         &thd_get_partitioned_indices,
         "Generate partitioned indices for input tokens");
+  m.def("thd_segment_add", &thd_segment_add, "thd_segment_add");
+  m.def("thd_segment_copy", &thd_segment_copy, "thd_segment_copy");
+  m.def("thd_seg_lse_correction", &thd_seg_lse_correction, "thd_seg_lse_correction");
+  m.def("thd_seg_read_lse", &thd_seg_read_lse, "thd_seg_read_lse");
+  m.def("thd_seg_out_correction", &thd_seg_out_correction, "thd_seg_out_correction");
 
   // Data structures
   py::class_<transformer_engine::FP8TensorMeta>(m, "FP8TensorMeta")

@@ -1421,7 +1421,7 @@ at::Tensor fa_prepare_bwd(at::Tensor q, at::Tensor k, at::Tensor v) {
 }
 
 /***************************************************************************************************
- * Support THD format for Context Parallel: Binary search
+ * Support THD format for Context Parallel
  **************************************************************************************************/
 
 __forceinline__
@@ -1438,12 +1438,430 @@ __device__ int binary_search(int target, int *array, int len) {
   return left - 1;
 }
 
+template <typename T, typename Functor>
+__global__ void thd_segment_elementwise_kernel(T *t1,
+                                               const T *t2,
+                                               const int *offset1,
+                                               const int *offset2,
+                                               const int *cu_lens,
+                                               int batch,
+                                               int hidden_size,
+                                               int len1,
+                                               int len2) {
+  extern __shared__ int s_cu_lens[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    s_cu_lens[i] = cu_lens[i];
+  }
+  __syncthreads();
+
+  const int warp_id = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+  const int lane_id = threadIdx.x % 32;
+  const int num_warps = blockDim.x * gridDim.x / 32;
+  const int total_tokens = s_cu_lens[batch];
+  const int loops_per_token = hidden_size * sizeof(T) / sizeof(int4);
+
+  t1 += (size_t)blockIdx.y * hidden_size * len1;
+  t2 += (size_t)blockIdx.y * hidden_size * len2;
+
+  for (int i = warp_id; i < total_tokens; i += num_warps) {
+    int seq_id = binary_search(i, s_cu_lens, batch + 1);
+
+    size_t idx1 = i - s_cu_lens[seq_id] + offset1[seq_id];
+    size_t idx2 = i - s_cu_lens[seq_id] + offset2[seq_id];
+    int4 *p1 = (int4*)&t1[idx1 * hidden_size];
+    int4 *p2 = (int4*)&t2[idx2 * hidden_size];
+
+    for (int j = lane_id; j < loops_per_token; j += 32) {
+      Functor::execute(&p1[j], &p2[j]);
+    }
+  }
+}
+
+template <typename T, typename Functor>
+__global__ void thd_segment_lse_kernel(T *lse1,
+                                       const float *lse2,
+                                       const int *offset1,
+                                       const int *offset2,
+                                       const int *cu_lens,
+                                       int batch,
+                                       int num_heads,
+                                       int max_len1,
+                                       int max_len2) {
+  extern __shared__ int s_cu_lens[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    s_cu_lens[i] = cu_lens[i];
+  }
+  __syncthreads();
+
+  const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int num_threads = blockDim.x * gridDim.x;
+  const size_t total_heads = (size_t)s_cu_lens[batch] * num_heads;
+
+  for (size_t i = tid; i < total_heads; i += num_threads) {
+    int head_id  = i % num_heads;
+    int token_id = i / num_heads;
+    int seq_id   = binary_search(token_id, s_cu_lens, batch + 1);
+
+    int token_in_seq = token_id - s_cu_lens[seq_id];
+    size_t row_offset = (size_t)seq_id * num_heads + head_id;
+    size_t idx1 = token_in_seq + offset1[seq_id] + row_offset * max_len1;
+    size_t idx2 = token_in_seq + offset2[seq_id] + row_offset * max_len2;
+
+    Functor::execute(&lse1[idx1], &lse2[idx2]);
+  }
+}
+
+template <typename T, int tile_size>
+__global__ void thd_out_correction_kernel(T *out1,
+                                          const T *out2,
+                                          const float *lse1,
+                                          const float *lse2,
+                                          const int *out_offset1,
+                                          const int *out_offset2,
+                                          const int *lse_offset1,
+                                          const int *lse_offset2,
+                                          const int *cu_lens,
+                                          int batch,
+                                          int num_heads,
+                                          int head_dim,
+                                          int max_len1,
+                                          int max_len2) {
+  extern __shared__ int s_cu_lens[];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    s_cu_lens[i] = cu_lens[i];
+  }
+  __syncthreads();
+
+  const int tile_id = (blockIdx.x * blockDim.x + threadIdx.x) / tile_size;
+  const int lane_id = threadIdx.x % tile_size;
+  const int num_tiles = blockDim.x * gridDim.x / tile_size;
+  const size_t total_heads = (size_t)s_cu_lens[batch] * num_heads;
+  const int loops_per_head = head_dim * sizeof(T) / sizeof(int4);
+
+  for (size_t i = tile_id; i < total_heads; i += num_tiles) {
+    int head_id  = i % num_heads;
+    int token_id = i / num_heads;
+    int seq_id   = binary_search(token_id, s_cu_lens, batch + 1);
+
+    int token_in_seq = token_id - s_cu_lens[seq_id];
+    size_t idx1, idx2;
+
+    // Get the corrected softmax_lse
+    size_t lse_row_offset = (size_t)seq_id * num_heads + head_id;
+    idx1 = token_in_seq + lse_offset1[seq_id] + lse_row_offset * max_len1;
+    idx2 = token_in_seq + lse_offset2[seq_id] + lse_row_offset * max_len2;
+    float lse = exp(lse2[idx2] - lse1[idx1]);
+
+    // Get the pointers of heads from out1 and out2
+    idx1 = ((size_t)(token_in_seq + out_offset1[seq_id]) * num_heads + head_id) * head_dim;
+    idx2 = ((size_t)(token_in_seq + out_offset2[seq_id]) * num_heads + head_id) * head_dim;
+    int4 *p1 = (int4*)&out1[idx1];
+    int4 *p2 = (int4*)&out2[idx2];
+
+    // Do correction for a head
+    for (int j = lane_id; j < loops_per_head; j += tile_size) {
+      int4 storage1 = p1[j];
+      int4 storage2 = p2[j];
+      T *s1 = (T*)&storage1;
+      T *s2 = (T*)&storage2;
+
+      #pragma unroll
+      for (int k = 0; k < sizeof(int4) / sizeof(T); k++) {
+        s1[k] += s2[k] * lse;
+      }
+
+      p1[j] = storage1;
+    }
+  }
+}
+
+template <typename T>
+struct NewAddFunctor {
+  __forceinline__ __device__
+  static void execute(int4 *p1, const int4 *p2) {
+    int4 storage1 = *p1;
+    int4 storage2 = *p2;
+    T *s1 = (T*)&storage1;
+    T *s2 = (T*)&storage2;
+
+    #pragma unroll
+    for (int i = 0; i < sizeof(int4) / sizeof(T); i++) {
+      s1[i] += s2[i];
+    }
+
+    *p1 = storage1;
+  }
+};
+
+template <typename T>
+struct NewCopyFunctor {
+  __forceinline__ __device__
+  static void execute(T *p1, const T *p2) {
+    *p1 = *p2;
+  }
+};
+
+struct NewLseFunctor {
+  __forceinline__ __device__
+  static void execute(double *lse, const float *lse_per_step) {
+    double val = *lse;
+    double val_per_step = (double)(*lse_per_step);
+    double max_scale = max(val, val_per_step);
+    double min_scale = min(val, val_per_step);
+    *lse = max_scale + log(1.0 + exp(min_scale - max_scale));
+  }
+};
+
+template <typename T, typename Functor>
+void thd_segment_elementwise_helper(at::Tensor &t1,
+                                    const at::Tensor &t2,
+                                    const at::Tensor &offset1,
+                                    const at::Tensor &offset2,
+                                    const at::Tensor &cu_lens,
+                                    size_t total_len) {
+  NVTE_CHECK(t1.dim() == 3 || t1.dim() == 4);
+  NVTE_CHECK(t2.dim() == t1.dim());
+  NVTE_CHECK(t1.scalar_type() == t2.scalar_type());
+
+  NVTE_CHECK(t1.size(t1.dim() - 1) == t2.size(t2.dim() - 1));
+  NVTE_CHECK(t1.size(t1.dim() - 2) == t2.size(t2.dim() - 2));
+  if (t1.dim() == 4) {
+    NVTE_CHECK(t1.size(0) == t2.size(0));
+  }
+
+  NVTE_CHECK(offset1.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(offset2.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_lens.scalar_type() == at::ScalarType::Int);
+
+  NVTE_CHECK(offset1.dim() == 1);
+  NVTE_CHECK(offset2.dim() == 1);
+  NVTE_CHECK(cu_lens.dim() == 1);
+
+  NVTE_CHECK(cu_lens.size(0) >= 2);
+  NVTE_CHECK(offset1.size(0) == cu_lens.size(0) || offset1.size(0) == cu_lens.size(0) - 1);
+  NVTE_CHECK(offset2.size(0) == cu_lens.size(0) || offset2.size(0) == cu_lens.size(0) - 1);
+
+  int batch = cu_lens.size(0) - 1;
+  int seq_dim = t1.dim() == 3 ? 0 : 1;
+  int hidden_size = t1.size(seq_dim + 1) * t1.size(seq_dim + 2);
+
+  // For 128-bits load/store
+  NVTE_CHECK((hidden_size * sizeof(T)) % 16 == 0);
+
+  unsigned int block = 256;
+  unsigned int num_blocks = (total_len * 32 + block - 1) / block;
+  dim3 grid(num_blocks, seq_dim + 1);
+  thd_segment_elementwise_kernel<T, Functor><<<grid, block, sizeof(int) * (batch + 1),
+                                               at::cuda::getCurrentCUDAStream()>>>(
+    t1.data_ptr<T>(),
+    t2.data_ptr<T>(),
+    offset1.data_ptr<int>(),
+    offset2.data_ptr<int>(),
+    cu_lens.data_ptr<int>(),
+    batch,
+    hidden_size,
+    t1.size(seq_dim),
+    t2.size(seq_dim));
+}
+
+template <typename T, typename Functor>
+void thd_segment_lse_helper(at::Tensor &lse1,
+                            const at::Tensor &lse2,
+                            const at::Tensor &offset1,
+                            const at::Tensor &offset2,
+                            const at::Tensor &cu_lens,
+                            size_t total_len) {
+  NVTE_CHECK(lse1.dim() == 3);
+  NVTE_CHECK(lse2.dim() == 3);
+  NVTE_CHECK(lse1.size(0) == lse2.size(0));
+  NVTE_CHECK(lse1.size(1) == lse2.size(1));
+
+  NVTE_CHECK(offset1.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(offset2.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_lens.scalar_type() == at::ScalarType::Int);
+
+  NVTE_CHECK(offset1.dim() == 1);
+  NVTE_CHECK(offset2.dim() == 1);
+  NVTE_CHECK(cu_lens.dim() == 1);
+
+  NVTE_CHECK(cu_lens.size(0) >= 2);
+  NVTE_CHECK(cu_lens.size(0) == lse1.size(0) + 1);
+  NVTE_CHECK(offset1.size(0) == cu_lens.size(0) || offset1.size(0) == cu_lens.size(0) - 1);
+  NVTE_CHECK(offset2.size(0) == cu_lens.size(0) || offset2.size(0) == cu_lens.size(0) - 1);
+
+  int batch     = lse1.size(0);
+  int num_heads = lse1.size(1);
+  int max_len1  = lse1.size(2);
+  int max_len2  = lse2.size(2);
+
+  unsigned int block = 256;
+  unsigned int num_blocks = (total_len * num_heads + block - 1) / block;
+  dim3 grid(num_blocks);
+  thd_segment_lse_kernel<T, Functor><<<grid, block, sizeof(int) * (batch + 1),
+                                       at::cuda::getCurrentCUDAStream()>>>(
+    lse1.data_ptr<T>(),
+    lse2.data_ptr<float>(),
+    offset1.data_ptr<int>(),
+    offset2.data_ptr<int>(),
+    cu_lens.data_ptr<int>(),
+    batch,
+    num_heads,
+    max_len1,
+    max_len2);
+}
+
+template <typename T>
+void thd_seg_out_correction_helper(at::Tensor &out1,
+                                   const at::Tensor &out2,
+                                   const at::Tensor &lse1,
+                                   const at::Tensor &lse2,
+                                   const at::Tensor &out_offset1,
+                                   const at::Tensor &out_offset2,
+                                   const at::Tensor &lse_offset1,
+                                   const at::Tensor &lse_offset2,
+                                   const at::Tensor &cu_lens,
+                                   size_t total_len) {
+  NVTE_CHECK(out1.device().is_cuda());
+
+  NVTE_CHECK(out1.dim() == 3 && out2.dim() == 3);
+  NVTE_CHECK(lse1.dim() == 3 && lse2.dim() == 3);
+  NVTE_CHECK(out_offset1.dim() == 1 && out_offset2.dim() == 1);
+  NVTE_CHECK(lse_offset1.dim() == 1 && lse_offset2.dim() == 1);
+  NVTE_CHECK(cu_lens.dim() == 1);
+
+  NVTE_CHECK(out1.size(1) == out2.size(1));
+  NVTE_CHECK(out1.size(2) == out2.size(2));
+  NVTE_CHECK(lse1.size(0) == lse2.size(0));
+  NVTE_CHECK(lse1.size(1) == lse2.size(1));
+
+  // NVTE_CHECK(out_offset1.size(0) >= 2);
+  // NVTE_CHECK(out_offset1.size(0) == out_offset2.size(0));
+  // NVTE_CHECK(out_offset1.size(0) == lse_offset1.size(0));
+  // NVTE_CHECK(out_offset1.size(0) == lse_offset2.size(0));
+
+  NVTE_CHECK(cu_lens.size(0) >= 2);
+  NVTE_CHECK(cu_lens.size(0) == lse1.size(0) + 1);
+
+  NVTE_CHECK(out_offset1.size(0) == cu_lens.size(0) || out_offset1.size(0) == cu_lens.size(0) - 1);
+  NVTE_CHECK(out_offset2.size(0) == cu_lens.size(0) || out_offset2.size(0) == cu_lens.size(0) - 1);
+  NVTE_CHECK(lse_offset1.size(0) == cu_lens.size(0) || lse_offset1.size(0) == cu_lens.size(0) - 1);
+  NVTE_CHECK(lse_offset2.size(0) == cu_lens.size(0) || lse_offset2.size(0) == cu_lens.size(0) - 1);
+
+  int batch     = lse1.size(0);
+  int num_heads = lse1.size(1);
+  int max_len1  = lse1.size(2);
+  int max_len2  = lse2.size(2);
+  int head_dim  = out1.size(2);
+
+  constexpr int tile_size = 16;
+  unsigned int block = 256;
+  unsigned int num_blocks = (total_len * tile_size + block - 1) / block;
+  dim3 grid(num_blocks);
+  thd_out_correction_kernel<T, tile_size><<<grid, block, sizeof(int) * (batch + 1),
+                                            at::cuda::getCurrentCUDAStream()>>>(
+    out1.data_ptr<T>(),
+    out2.data_ptr<T>(),
+    lse1.data_ptr<float>(),
+    lse2.data_ptr<float>(),
+    out_offset1.data_ptr<int>(),
+    out_offset2.data_ptr<int>(),
+    lse_offset1.data_ptr<int>(),
+    lse_offset2.data_ptr<int>(),
+    cu_lens.data_ptr<int>(),
+    batch,
+    num_heads,
+    head_dim,
+    max_len1,
+    max_len2);
+}
+
+void thd_segment_add(at::Tensor &t1,
+                     const at::Tensor &t2,
+                     const at::Tensor &offset1,
+                     const at::Tensor &offset2,
+                     const at::Tensor &cu_lens,
+                     size_t total_len) {
+  if (t1.scalar_type() == at::ScalarType::Half) {
+    using T = at::Half;
+    thd_segment_elementwise_helper<T, NewAddFunctor<T>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else if (t1.scalar_type() == at::ScalarType::BFloat16) {
+    using T = at::BFloat16;
+    thd_segment_elementwise_helper<T, NewAddFunctor<T>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else if (t1.scalar_type() == at::ScalarType::Float) {
+    using T = float;
+    thd_segment_elementwise_helper<T, NewAddFunctor<T>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else {
+    NVTE_ERROR("thd_segment_add only supports FP16/BF16/FP32 data types. \n");
+  }
+}
+
+void thd_segment_copy(at::Tensor &t1,
+                      const at::Tensor &t2,
+                      const at::Tensor &offset1,
+                      const at::Tensor &offset2,
+                      const at::Tensor &cu_lens,
+                      size_t total_len) {
+  if (t1.scalar_type() == at::ScalarType::Half) {
+    using T = at::Half;
+    thd_segment_elementwise_helper<T, NewCopyFunctor<int4>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else if (t1.scalar_type() == at::ScalarType::BFloat16) {
+    using T = at::BFloat16;
+    thd_segment_elementwise_helper<T, NewCopyFunctor<int4>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else if (t1.scalar_type() == at::ScalarType::Float) {
+    using T = float;
+    thd_segment_elementwise_helper<T, NewCopyFunctor<int4>>(t1, t2, offset1, offset2, cu_lens, total_len);
+  } else {
+    NVTE_ERROR("thd_segment_copy only supports FP16/BF16/FP32 data types. \n");
+  }
+}
+
+void thd_seg_lse_correction(at::Tensor &lse1, const at::Tensor &lse2,
+                            const at::Tensor &offset1, const at::Tensor &offset2,
+                            const at::Tensor &cu_lens, size_t total_len) {
+  thd_segment_lse_helper<double, NewLseFunctor>(
+    lse1, lse2, offset1, offset2, cu_lens, total_len);
+}
+
+void thd_seg_read_lse(at::Tensor &lse1, const at::Tensor &lse2,
+                      const at::Tensor &offset1, const at::Tensor &offset2,
+                      const at::Tensor &cu_lens, size_t total_len) {
+  thd_segment_lse_helper<float, NewCopyFunctor<float>>(
+    lse1, lse2, offset1, offset2, cu_lens, total_len);
+}
+
+void thd_seg_out_correction(at::Tensor &out1, const at::Tensor &out2, const at::Tensor &lse1,
+                            const at::Tensor &lse2, const at::Tensor &out_offset1,
+                            const at::Tensor &out_offset2, const at::Tensor &lse_offset1,
+                            const at::Tensor &lse_offset2, const at::Tensor &cu_lens,
+                            size_t total_len) {
+  if (out1.scalar_type() == at::ScalarType::Half) {
+    thd_seg_out_correction_helper<at::Half>(
+      out1, out2, lse1, lse2, out_offset1, out_offset2, lse_offset1, lse_offset2, cu_lens,
+      total_len);
+  } else if (out1.scalar_type() == at::ScalarType::BFloat16) {
+    thd_seg_out_correction_helper<at::BFloat16>(
+      out1, out2, lse1, lse2, out_offset1, out_offset2, lse_offset1, lse_offset2, cu_lens,
+      total_len);
+  } else if (out1.scalar_type() == at::ScalarType::Float) {
+    thd_seg_out_correction_helper<float>(
+      out1, out2, lse1, lse2, out_offset1, out_offset2, lse_offset1, lse_offset2, cu_lens,
+      total_len);
+  } else {
+    NVTE_ERROR("thd_seg_out_correction only supports FP16/BF16/FP32 data types. \n");
+  }
+}
+
 /***************************************************************************************************
  * Support THD format for Context Parallel: Read the half of a THD tensor
  **************************************************************************************************/
 
-__global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_seqlens,
-                                            int batch, int hidden_size_in_bytes, int half_idx) {
+__global__ void thd_read_half_tensor_kernel(void *half,
+                                            void *tensor,
+                                            int *cu_seqlens,
+                                            int batch,
+                                            int hidden_size_in_bytes,
+                                            int half_idx,
+                                            int token_offset) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     cu_seqlens_s[i] = cu_seqlens[i] / 2;
@@ -1456,9 +1874,9 @@ __global__ void thd_read_half_tensor_kernel(void *half, void *tensor, int *cu_se
   int num_total_tokens = cu_seqlens_s[batch];
   int num_float4s_per_token = hidden_size_in_bytes / sizeof(float4);
 
-  size_t offset = num_total_tokens * (size_t)hidden_size_in_bytes;
-  half = (void*)((char*)half + offset * blockIdx.y);
-  tensor = (void*)((char*)tensor + 2 * offset * blockIdx.y);
+  size_t offset = token_offset * (size_t)hidden_size_in_bytes;
+  half = (void*)((char*)half + offset/2 * blockIdx.y);
+  tensor = (void*)((char*)tensor + offset * blockIdx.y);
 
   for (int token_id = warpid; token_id < num_total_tokens; token_id += num_warps) {
     int seqid = binary_search(token_id, cu_seqlens_s, batch + 1);
@@ -1517,7 +1935,8 @@ at::Tensor thd_read_half_tensor(const at::Tensor &tensor,
     cu_seqlens.data_ptr<int>(),
     batch,
     hidden_size_in_bytes,
-    half_idx);
+    half_idx,
+    tensor.size(seq_dim));
 
   return half;
 }
@@ -1783,7 +2202,7 @@ void thd_out_correction(at::Tensor &out,
 
 template <typename dtype, typename Functor_0, typename Functor_1, int functor_idx, int group_size>
 __global__ void thd_grad_correction_kernel(dtype *grad, dtype *grad_per_step, int *cu_seqlens,
-                                           int batch, int hidden_size) {
+                                           int batch, int hidden_size, int token_offset) {
   extern __shared__ int cu_seqlens_s[];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
     if constexpr (functor_idx < 2) {
@@ -1800,13 +2219,13 @@ __global__ void thd_grad_correction_kernel(dtype *grad, dtype *grad_per_step, in
   int num_total_tokens = cu_seqlens_s[batch];
   int num_inner_loops = hidden_size * sizeof(dtype) / sizeof(float4);
 
-  size_t offset = num_total_tokens * (size_t)hidden_size;
-  grad_per_step = grad_per_step + offset * blockIdx.y;
+  size_t offset = token_offset * (size_t)hidden_size;
   if constexpr (functor_idx < 2) {
-    grad = grad + offset * blockIdx.y * 2;
+    grad_per_step = grad_per_step + offset / 2 * blockIdx.y;
   } else {
-    grad = grad + offset * blockIdx.y;
+    grad_per_step = grad_per_step + offset * blockIdx.y;
   }
+  grad = grad + offset * blockIdx.y;
 
   for (int token_id = group_id; token_id < num_total_tokens; token_id += num_groups) {
     int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
@@ -1909,7 +2328,8 @@ static void thd_grad_correction_helper(at::Tensor &grad,
       grad_per_step.data_ptr<dtype>(),
       cu_seqlens.data_ptr<int>(),
       batch,
-      hidden_size);
+      hidden_size,
+      total_tokens);
 }
 
 template <typename dtype>
@@ -1958,58 +2378,170 @@ void thd_grad_correction(at::Tensor &grad,
 }
 
 /***************************************************************************************************
+ * Support THD format for Context Parallel:
+ * Handle the situation where seqlen is not divisible by cp*2
+ **************************************************************************************************/
+
+__global__ void thd_padding_kernel(void *dst,
+                                   const void *src,
+                                   const int *cu_seqlens_dst,
+                                   const int *cu_seqlens_src,
+                                   int batch,
+                                   int hidden_size_in_bytes,
+                                   int dst_len) {
+  extern __shared__ int smem[];
+  int *smem_dst = &smem[0];
+  int *smem_src = &smem[batch + 1];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    smem_dst[i] = cu_seqlens_dst[i];
+    smem_src[i] = cu_seqlens_src[i];
+  }
+  __syncthreads();
+
+  const int warpid = (blockDim.x * blockIdx.x + threadIdx.x) / 32;
+  const int num_warps = (blockDim.x * gridDim.x) / 32;
+  const int laneid = threadIdx.x % 32;
+
+  for (int i = warpid; i < smem_dst[batch]; i += num_warps) {
+    float4 *dst_token = (float4*)((char*)dst + i * (size_t)hidden_size_in_bytes);
+
+    int seqid = binary_search(i, smem_dst, batch + 1);
+    int offset = i - smem_dst[seqid] + smem_src[seqid];
+
+    if (offset < smem_src[seqid + 1]) {
+      float4 *src_token = (float4*)((char*)src + offset * (size_t)hidden_size_in_bytes);
+      for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+        dst_token[j] = src_token[j];
+      }
+    } else {
+      for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+        dst_token[j] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+      }
+    }
+  }
+
+  for (int i = smem_dst[batch] + warpid; i < dst_len; i += num_warps) {
+    float4 *dst_token = (float4*)((char*)dst + i * (size_t)hidden_size_in_bytes);
+    for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+      dst_token[j] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+  }
+}
+
+at::Tensor thd_padding(const at::Tensor &tensor,
+                       const at::Tensor &cu_seqlens,
+                       const at::Tensor &cu_seqlens_padded,
+                       int output_len,
+                       bool reverse) {
+  NVTE_CHECK(tensor.dim() == 3);
+  NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens.dim() == 1);
+  NVTE_CHECK(cu_seqlens.size(0) >= 2);
+  NVTE_CHECK(cu_seqlens_padded.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens_padded.dim() == 1);
+  NVTE_CHECK(cu_seqlens_padded.size(0) == cu_seqlens.size(0));
+  if (reverse) {
+    NVTE_CHECK(tensor.size(0) >= output_len);
+  } else {
+    NVTE_CHECK(tensor.size(0) <= output_len);
+  }
+
+  int batch        = cu_seqlens_padded.size(0) - 1;
+  int num_heads    = tensor.size(1);
+  int dim_per_head = tensor.size(2);
+  size_t hidden_size_in_bytes = num_heads * dim_per_head * \
+                                c10::elementSize(tensor.scalar_type());
+  // For 128-bit load/stroe
+  NVTE_CHECK(hidden_size_in_bytes % 16 == 0);
+
+  std::vector<int64_t> shape{output_len, num_heads, dim_per_head};
+  at::Tensor output_tensor = at::empty(shape, at::CUDA(tensor.scalar_type()));
+
+  const int *cu_seqlens_dst;
+  const int *cu_seqlens_src;
+  if (reverse) {
+    cu_seqlens_dst = cu_seqlens.data_ptr<int>();
+    cu_seqlens_src = cu_seqlens_padded.data_ptr<int>();
+  } else {
+    cu_seqlens_src = cu_seqlens.data_ptr<int>();
+    cu_seqlens_dst = cu_seqlens_padded.data_ptr<int>();
+  }
+
+  constexpr unsigned int block = 256;
+  unsigned int grid = (output_len * 32 + block - 1) / block;
+  thd_padding_kernel<<<grid, block, sizeof(int) * (batch+1) * 2,
+                       at::cuda::getCurrentCUDAStream()>>>(
+    output_tensor.data_ptr(),
+    tensor.data_ptr(),
+    cu_seqlens_dst,
+    cu_seqlens_src,
+    batch,
+    hidden_size_in_bytes,
+    output_len);
+
+  return output_tensor;
+}
+
+/***************************************************************************************************
  * Support THD format for Context Parallel: Generate partitioned indices for input tokens
  **************************************************************************************************/
 
 __global__ void thd_partition_indices_kernel(int *output,
                                              int *cu_seqlens,
+                                             int *cu_seqlens_global,
                                              int batch,
-                                             int total_tokens,
                                              int world_size,
                                              int rank) {
   extern __shared__ int cu_seqlens_s[];
+  int *cu_seqlens_g = &cu_seqlens_s[batch+1];
   for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
-    cu_seqlens_s[i] = cu_seqlens[i] / world_size;
+    cu_seqlens_s[i] = cu_seqlens[i];
+    cu_seqlens_g[i] = cu_seqlens_global[i];
   }
   __syncthreads();
 
   int tid = blockIdx.x * blockDim.x + threadIdx.x;
   int num_threads = blockDim.x * gridDim.x;
+  int total_tokens = cu_seqlens_s[batch];
 
-  for (int token_id = tid; token_id < total_tokens / world_size; token_id += num_threads) {
+  for (int token_id = tid; token_id < total_tokens; token_id += num_threads) {
     int seq_id = binary_search(token_id, cu_seqlens_s, batch + 1);
-    int seq_len = cu_seqlens_s[seq_id + 1] - cu_seqlens_s[seq_id];
+    int seq_len = cu_seqlens_g[seq_id + 1] - cu_seqlens_g[seq_id];
+    int n = (seq_len + (2*world_size) - 1) / (2*world_size);
     int index = token_id - cu_seqlens_s[seq_id];
-    int offset = index < seq_len/2 ? rank : (world_size-1) * 2 - rank;
-    index += cu_seqlens_s[seq_id] * world_size + seq_len / 2 * offset;
+    int offset = index < n ? rank : (2*world_size - 2 - rank);
+    index += cu_seqlens_g[seq_id] + n * offset;
     output[token_id] = index;
   }
 }
 
 at::Tensor thd_get_partitioned_indices(const at::Tensor &cu_seqlens,
-                                       int total_tokens,
+                                       const at::Tensor &cu_seqlens_global,
+                                       int output_len,
                                        int world_size,
                                        int rank) {
   NVTE_CHECK(cu_seqlens.scalar_type() == at::ScalarType::Int);
   NVTE_CHECK(cu_seqlens.dim() == 1);
   NVTE_CHECK(cu_seqlens.size(0) >= 2);
+  NVTE_CHECK(cu_seqlens_global.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens_global.dim() == 1);
+  NVTE_CHECK(cu_seqlens_global.size(0) == cu_seqlens.size(0));
+  NVTE_CHECK(output_len > 0);
   NVTE_CHECK(rank >= 0 && rank < world_size);
-  NVTE_CHECK(world_size > 0);
-  NVTE_CHECK(total_tokens > 0 && total_tokens % (world_size * 2) == 0);
 
   int batch = cu_seqlens.size(0) - 1;
 
-  std::vector<int64_t> shape = {total_tokens / world_size};
+  std::vector<int64_t> shape = {output_len};
   at::Tensor output = at::empty(shape, at::CUDA(at::ScalarType::Int));
 
   constexpr unsigned int block = 256;
   unsigned int grid = (output.size(0) + block - 1) / block;
-  thd_partition_indices_kernel<<<grid, block, sizeof(int) * (batch+1),
+  thd_partition_indices_kernel<<<grid, block, sizeof(int) * (batch+1) * 2,
                                  at::cuda::getCurrentCUDAStream()>>>(
     output.data_ptr<int>(),
     cu_seqlens.data_ptr<int>(),
+    cu_seqlens_global.data_ptr<int>(),
     batch,
-    total_tokens,
     world_size,
     rank);
 

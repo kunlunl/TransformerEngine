@@ -642,8 +642,60 @@ void thd_grad_correction(at::Tensor &grad,
                          const std::string &second_half
 );
 
+at::Tensor thd_padding(const at::Tensor &tensor,
+                       const at::Tensor &cu_seqlens,
+                       const at::Tensor &cu_seqlens_padded,
+                       int output_len,
+                       bool reverse
+);
+
+void thd_segment_add(at::Tensor &t1,
+                     const at::Tensor &t2,
+                     const at::Tensor &offset1,
+                     const at::Tensor &offset2,
+                     const at::Tensor &cu_lens,
+                     size_t total_len
+);
+
+void thd_segment_copy(at::Tensor &t1,
+                      const at::Tensor &t2,
+                      const at::Tensor &offset1,
+                      const at::Tensor &offset2,
+                      const at::Tensor &cu_lens,
+                      size_t total_len
+);
+
+void thd_seg_lse_correction(at::Tensor &lse1,
+                            const at::Tensor &lse2,
+                            const at::Tensor &offset1,
+                            const at::Tensor &offset2,
+                            const at::Tensor &cu_lens,
+                            size_t total_len
+);
+
+void thd_seg_read_lse(at::Tensor &lse1,
+                      const at::Tensor &lse2,
+                      const at::Tensor &offset1,
+                      const at::Tensor &offset2,
+                      const at::Tensor &cu_lens,
+                      size_t total_len
+);
+
+void thd_seg_out_correction(at::Tensor &out1,
+                            const at::Tensor &out2,
+                            const at::Tensor &lse1,
+                            const at::Tensor &lse2,
+                            const at::Tensor &out_offset1,
+                            const at::Tensor &out_offset2,
+                            const at::Tensor &lse_offset1,
+                            const at::Tensor &lse_offset2,
+                            const at::Tensor &cu_lens,
+                            size_t total_len
+);
+
 at::Tensor thd_get_partitioned_indices(const at::Tensor &cu_seqlens,
-                                       int total_tokens,
+                                       const at::Tensor &cu_seqlens_global,
+                                       int output_len,
                                        int world_size,
                                        int rank
 );

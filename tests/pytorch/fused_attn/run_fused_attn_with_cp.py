@@ -5,13 +5,13 @@
 import os, sys
 import torch
 import torch.distributed as dist
-from transformer_engine.pytorch.attention import DotProductAttention
+from transformer_engine.pytorch.attention import DotProductAttention, partition_thd_input_with_cp
 import transformer_engine_extensions as tex
 from test_fused_attn_with_cp import model_configs
 
 dtypes={'fp16' : torch.float16, 'bf16' : torch.bfloat16}
 
-def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend='FlashAttention'):
+def run_dpa_with_cp(dtype='bf16', model='cp_1_0', qkv_format='bshd', kernel_backend='FlashAttention'):
     """Test DotProductAttention module with context parallelism"""
 
     os.environ["NVTE_FLASH_ATTN"] = "0"
@@ -42,6 +42,13 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
     cp_comm_group = dist.new_group(cp_comm_ranks, backend='nccl')
 
     config = model_configs[model]
+    config.max_seqlen_q = 16*1024
+    config.max_seqlen_kv = 16*1024
+    config.num_heads = 12
+    config.num_gqa_groups = 12
+    config.batch_size = 1
+    config.head_dim = 128
+    config.attn_mask_type = 'causal'
 
     assert config.attn_mask_type in ['causal', 'no_mask'], f"{config.attn_mask_type} is an unsupported attention mask type!"
 
@@ -68,9 +75,10 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         cu_seqlens_q = None
         cu_seqlens_kv = None
     else:
-        assert(config.max_seqlen_q % (world_size * 2) == 0)
-        seqlens_q = torch.randint(world_size * 2, config.max_seqlen_q + 1, [config.batch_size]).to(torch.int32)
-        seqlens_q = seqlens_q - seqlens_q % (world_size * 2)
+        #assert(config.max_seqlen_q % (world_size * 2) == 0)
+        #seqlens_q = torch.randint(world_size * 2, config.max_seqlen_q + 1, [config.batch_size]).to(torch.int32)
+        #seqlens_q = seqlens_q - seqlens_q % (world_size * 2)
+        seqlens_q = torch.Tensor([config.max_seqlen_q] * config.batch_size).to(torch.int32)
         cu_seqlens_q = torch.cat([torch.zeros([1], dtype=torch.int32), seqlens_q.cumsum(0)])
         cu_seqlens_kv = cu_seqlens_q
         q_input_shape = (cu_seqlens_q[-1], config.num_heads, config.head_dim)
@@ -108,19 +116,50 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
         q_, k_, v_, dout_ = [x.view(*x.shape[:seq_dim], -1, *x.shape[(seq_dim+2):]) for x in [q_, k_, v_, dout_]]
     else:
         q_, k_, v_, dout_ = [x.clone().detach() for x in [q, k, v, dout]]
-        seq_idx_q  = tex.thd_get_partitioned_indices(cu_seqlens_q, q_.size(0), world_size, rank)
-        seq_idx_kv = tex.thd_get_partitioned_indices(cu_seqlens_kv, k_.size(0), world_size, rank)
+        seq_idx_q, cu_seqlens_q_local, max_seqlen_q_local, padding_params_q = partition_thd_input_with_cp(cu_seqlens_q, world_size, rank)
+        seq_idx_kv, cu_seqlens_kv_local, max_seqlen_kv_local, padding_params_kv = partition_thd_input_with_cp(cu_seqlens_kv, world_size, rank)
+        #seq_idx_q  = tex.thd_get_partitioned_indices(cu_seqlens_q, q_.size(0), world_size, rank)
+        #seq_idx_kv = tex.thd_get_partitioned_indices(cu_seqlens_kv, k_.size(0), world_size, rank)
         q_, dout_ = [x.index_select(0, seq_idx_q) for x in [q_, dout_]]
         k_, v_ = [x.index_select(0, seq_idx_kv) for x in [k_, v_]]
 
     q_, k_, v_ = [x.requires_grad_() for x in [q_, k_, v_]]
     core_attn.set_context_parallel_group(cp_comm_group, cp_comm_ranks, torch.cuda.Stream())
 
-    if qkv_format == "bshd" or qkv_format == "sbhd":
-        out_ = core_attn(q_, k_, v_)
-    else:
-        out_ = core_attn(q_, k_, v_, cu_seqlens_q=cu_seqlens_q//world_size, cu_seqlens_kv=cu_seqlens_kv//world_size)
-    out_.backward(dout_)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    n_iters = 100
+    n_warmups = 3
+
+    padding_params_q = None
+    padding_params_kv = None
+
+    for i in range(n_iters):
+
+        if i == n_warmups:
+            start.record()
+
+        if qkv_format == "bshd" or qkv_format == "sbhd":
+            out_ = core_attn(q_, k_, v_)
+        else:
+            out_ = core_attn(q_, k_, v_,
+                            cu_seqlens_q=cu_seqlens_q_local,
+                            cu_seqlens_kv=cu_seqlens_kv_local,
+                            max_seqlen_q=max_seqlen_q_local,
+                            max_seqlen_kv=max_seqlen_kv_local,
+                            thd_padding_params_q=padding_params_q,
+                            thd_padding_params_k=padding_params_kv)
+        out_.backward(dout_)
+
+        if i < n_iters - 1:
+            q_.grad[:] = 0
+            k_.grad[:] = 0
+            v_.grad[:] = 0
+
+    end.record()
+    end.synchronize()
+    print(start.elapsed_time(end) / (n_iters - n_warmups))
 
     for x in [out_, q_.grad, k_.grad, v_.grad]:
         assert(torch.all(~torch.isnan(x)))

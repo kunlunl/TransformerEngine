@@ -489,6 +489,125 @@ def flash_attn_fwd_softmax_lse_correction(softmax_lse, softmax_lse_per_step):
     softmax_lse.copy_(new_scale)
 
 
+class PaddingParams:
+    def __init__(
+        self,
+        cu_seqlens_padded,
+        total_seqlen_padded,
+        max_seqlen_padded,
+    ):
+        self.cu_seqlens_padded = cu_seqlens_padded
+        self.total_seqlen_padded = total_seqlen_padded
+        self.max_seqlen_padded = max_seqlen_padded
+
+
+def partition_thd_input_with_cp(cu_seqlens_global, world_size, rank):
+    lens = cu_seqlens_global[1:] - cu_seqlens_global[:-1]
+    n = (lens + 2*world_size - 1) // (2*world_size)
+    zeros = torch.zeros_like(n)
+    len1 = torch.max(n - torch.max((rank+1)*n - lens, zeros), zeros)
+    len2 = torch.max(n - torch.max((2*world_size-rank)*n - lens, zeros), zeros)
+    local_lens = len1 + len2
+    padded_lens = n * 2
+    max_seqlen = torch.max(local_lens).item()
+    max_seqlen_padded = torch.max(padded_lens).item()
+    zero = zeros[:1]
+    cu_seqlens = torch.cumsum(torch.cat([zero, local_lens]), dim=0).to(cu_seqlens_global.dtype)
+    cu_seqlens_padded = torch.cumsum(torch.cat([zero, padded_lens]), dim=0).to(cu_seqlens_global.dtype)
+    total_seqlen = cu_seqlens[-1].item()
+    total_seqlen_padded = cu_seqlens_padded[-1].item()
+    partitioned_indices = tex.thd_get_partitioned_indices(cu_seqlens,
+                                                          cu_seqlens_global,
+                                                          total_seqlen,
+                                                          world_size,
+                                                          rank)
+    # if torch.all(lens % (2*world_size) == 0):
+    #     partition_params = None
+    # else:
+    #     partition_params = PaddingParams(cu_seqlens_padded.cuda(),
+    #                                      total_seqlen_padded,
+    #                                      max_seqlen_padded)
+    partition_params = PaddingParams(cu_seqlens_padded.cuda(),
+                                     total_seqlen_padded,
+                                     max_seqlen_padded)
+    return partitioned_indices, cu_seqlens, max_seqlen, partition_params
+
+
+class PartitionParam:
+    """
+    Contains information about how context parallelism splits the inputs.
+    This is necessary when the length of input sequence is not divisible by cp_size*2,
+    because the lengths on other ranks cannot be inferred from the local cu_seqlens.
+    """
+    def __init__(
+        self,
+        offsets_0: List[torch.Tensor] = None,
+        offsets_1: List[torch.Tensor] = None,
+        lse_offsets_0: List[torch.Tensor] = None,
+        lse_offsets_1: List[torch.Tensor] = None,
+        cu_lens: List[torch.Tensor] = None,
+        cu_lens_0: List[torch.Tensor] = None,
+        cu_lens_1: List[torch.Tensor] = None,
+        total_lens: List[int] = None,
+        total_lens_0: List[int] = None,
+        total_lens_1: List[int] = None,
+        max_lens: List[int] = None,
+        max_lens_0: List[int] = None,
+        max_lens_1: List[int] = None,
+    ):
+        self.offsets_0 = offsets_0
+        self.offsets_1 = offsets_1
+        self.lse_offsets_0 = lse_offsets_0
+        self.lse_offsets_1 = lse_offsets_1
+        self.cu_lens = cu_lens
+        self.cu_lens_0 = cu_lens_0
+        self.cu_lens_1 = cu_lens_1
+        self.total_lens = total_lens
+        self.total_lens_0 = total_lens_0
+        self.total_lens_1 = total_lens_1
+        self.max_lens = max_lens
+        self.max_lens_0 = max_lens_0
+        self.max_lens_1 = max_lens_1
+
+
+@jit_fuser
+def infer_offsets_from_cu_seqlens(cu_seqlens):
+    seqlens = cu_seqlens[1:] - cu_seqlens[:-1]
+    lse_offset_0 = torch.zeros_like(seqlens)
+    lse_offset_1 = seqlens // 2
+    offset_0 = cu_seqlens[:-1]
+    offset_1 = offset_0 + lse_offset_1
+    return offset_0, offset_1, lse_offset_0, lse_offset_1
+
+
+def infer_partition_param_from_cu_seqlens(cu_seqlens: torch.Tensor,
+                                          total_len: int,
+                                          max_seqlen: int,
+                                          world_size: int):
+    param = PartitionParam()
+
+    offset_0, offset_1, lse_offset_0, lse_offset_1 = infer_offsets_from_cu_seqlens(cu_seqlens)
+    param.offsets_0 = [offset_0] * world_size
+    param.offsets_1 = [offset_1] * world_size
+    param.lse_offsets_0 = [lse_offset_0] * world_size
+    param.lse_offsets_1 = [lse_offset_1] * world_size
+
+    param.cu_lens = [cu_seqlens] * world_size
+    half_cu_seqlens = cu_seqlens // 2
+    param.cu_lens_0 = [half_cu_seqlens] * world_size
+    param.cu_lens_1 = [half_cu_seqlens] * world_size
+
+    param.total_len = [total_len] * world_size
+    param.total_lens_0 = [total_len // 2] * world_size
+    param.total_lens_1 = [total_len // 2] * world_size
+
+    param.max_lens = [max_seqlen] * world_size
+    param.max_lens_0 = [max_seqlen // 2] * world_size
+    param.max_lens_1 = [max_seqlen // 2] * world_size
+
+    return param
+
+
 class AttnFuncWithCP(torch.autograd.Function):
     """
     Attention implementation with context parallelism.
@@ -499,7 +618,7 @@ class AttnFuncWithCP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, is_training, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p, cp_group, cp_global_ranks, cp_stream, softmax_scale, attn_mask_type,
-                deterministic, use_fused_attention):
+                deterministic, use_fused_attention, partition_param_q, partition_param_k):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -511,6 +630,36 @@ class AttnFuncWithCP(torch.autograd.Function):
 
         causal = (attn_mask_type == "causal")
         thd = (len(q.shape) == 3)
+
+        if thd:
+            assert((partition_param_q is None and partition_param_k is None) or \
+                   (partition_param_q is not None and partition_param_k is not None)), \
+                   "partition_param_q and partition_param_k must both be None or both not be None"
+
+            if partition_param_q is None:
+                partition_param_q = infer_partition_param_from_cu_seqlens(
+                    cu_seqlens_q, q.size(0), max_seqlen_q, cp_size)
+                partition_param_k = infer_partition_param_from_cu_seqlens(
+                    cu_seqlens_k, k.size(0), max_seqlen_k, cp_size)
+                warnings.warn(
+                    "Partition information is infered from cu_seqlens with assumption that "
+                    "all seqlens are divisible by cp_size * 2. If this is not the case, "
+                    "please pass in the PartitionParam."
+                )
+
+            # if thd_padding_params_q is not None:
+            #     assert(thd_padding_params_k is not None)
+            #     total_seqlen_q = q.size(0)
+            #     total_seqlen_k = k.size(0)
+            #     cu_seqlens_q_ = cu_seqlens_q
+            #     cu_seqlens_k_ = cu_seqlens_k
+            #     cu_seqlens_q = thd_padding_params_q.cu_seqlens_padded
+            #     cu_seqlens_k = thd_padding_params_k.cu_seqlens_padded
+            #     max_seqlen_q = thd_padding_params_q.max_seqlen_padded
+            #     max_seqlen_k = thd_padding_params_k.max_seqlen_padded
+            #     q = tex.thd_padding(q, cu_seqlens_q_, cu_seqlens_q, thd_padding_params_q.total_seqlen_padded, False)
+            #     k = tex.thd_padding(k, cu_seqlens_k_, cu_seqlens_k, thd_padding_params_k.total_seqlen_padded, False)
+            #     v = tex.thd_padding(v, cu_seqlens_k_, cu_seqlens_k, thd_padding_params_k.total_seqlen_padded, False)
 
         if causal and not thd:
             # [b, s, np, hn] -> [b, 2, s//2, np, hn]
@@ -548,7 +697,11 @@ class AttnFuncWithCP(torch.autograd.Function):
                         req.wait()
 
                     if i < (cp_size-1):
-                        p2p_comm_buffers[i+1] = torch.empty_like(p2p_comm_buffers[i])
+                        if thd:
+                            # p2p_comm_buffers[i+1] = torch.empty_like(p2p_comm_buffers[i])
+
+                        else:
+                            p2p_comm_buffers[i+1] = torch.empty_like(p2p_comm_buffers[i])
                         send_recv_reqs[i%2] = flash_attn_p2p_communicate(rank,
                                                                          p2p_comm_buffers[i],
                                                                          send_dst,
@@ -607,10 +760,22 @@ class AttnFuncWithCP(torch.autograd.Function):
                                 q_inputs[i%2] = q.view(-1, *q.shape[-2:])
                                 if thd:
                                     # [2, t, np, hn] -> [2, t/2, np, hn]
-                                    kv_inputs[i%2] = tex.thd_read_half_tensor(kv_inputs[i%2], cu_seqlens_k, 0)
+                                    #kv_inputs[i%2] = tex.thd_read_half_tensor(kv_inputs[i%2], cu_seqlens_k, 0)
+                                    param = partition_param_k[(i + cp_size - 1) % cp_size]
+                                    np, hn = kv_inputs[i%2].shape[-2:]
+                                    half_kv = torch.empty([2, param.half_total_seqlens_0, np, hn],
+                                                          dtype=kv_inputs[i%2].dtype,
+                                                          device=kv_inputs[i%2].device)
+                                    tex.thd_segment_copy(half_kv, kv_inputs[i%2], *param.copy_half_0,
+                                                         half_kv.size(1))
+                                    kv_inputs[i%2] = half_kv
+                                    cu_seqlens_k_ = param.half_cu_seqlens_0
+                                    max_seqlen_k_ = param.half_max_seqlen_0
                                 else:
                                     # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn]
                                     kv_inputs[i%2] = kv_inputs[i%2][:, :, 0, ...].contiguous()
+                                    cu_seqlens_k_ = cu_seqlens_k // 2
+                                    max_seqlen_k_ = max_seqlen_k // 2
                                 # [2, b, sk//2, np, hn] -> [2, b*sk//2, np, hn]
                                 kv_inputs[i%2] = kv_inputs[i%2].view(2, -1, *k.shape[-2:])
                                 if _flash_attn_2_3_plus:
@@ -618,7 +783,7 @@ class AttnFuncWithCP(torch.autograd.Function):
                                 _, _, _, _, out_per_step[i], \
                                 softmax_lse_per_step[i], _, rng_states[i] = _flash_attn_forward(
                                     q_inputs[i%2], kv_inputs[i%2][0], kv_inputs[i%2][1],
-                                    cu_seqlens_q, cu_seqlens_k//2, max_seqlen_q, max_seqlen_k//2,
+                                    cu_seqlens_q, cu_seqlens_k_, max_seqlen_q, max_seqlen_k_,
                                     dropout_p, softmax_scale, causal=False, return_softmax=False,
                                     **fa_optional_forward_kwargs
                                 )
@@ -641,10 +806,15 @@ class AttnFuncWithCP(torch.autograd.Function):
                             else:
                                 if thd:
                                     # [t, np, hn] -> [t/2, np, hn]
-                                    q_inputs[i%2] = tex.thd_read_half_tensor(q, cu_seqlens_q, 1)
+                                    # q_inputs[i%2] = tex.thd_read_half_tensor(q, cu_seqlens_q, 1)
+                                    t, np, hn = q.size()
+                                    half_q = torch.empty([t//2, np, hn], dtype=q.dtype, device=q.device)
+                                    tex.thd_segment_copy(half_q, q, cu_lens_q, offset1_q, cu_lens_q, t//2)
+                                    q_inputs[i%2] = half_q
                                 else:
                                     # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                                     q_inputs[i%2] = q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
+                                    cu_lens_q = cu_seqlens_q // 2
                                 # [2, b, 2, sk//2, np, hn] -> [2, b*sk, np, hn]
                                 kv_inputs[i%2] = kv_inputs[i%2].view(2, -1, *k.shape[-2:])
                                 if _flash_attn_2_3_plus:
@@ -652,7 +822,7 @@ class AttnFuncWithCP(torch.autograd.Function):
                                 _, _, _, _, out_per_step[i], \
                                 softmax_lse_per_step[i], _, rng_states[i] = _flash_attn_forward(
                                     q_inputs[i%2], kv_inputs[i%2][0], kv_inputs[i%2][1],
-                                    cu_seqlens_q//2, cu_seqlens_k, max_seqlen_q//2, max_seqlen_k,
+                                    cu_lens_q, cu_seqlens_k, max_seqlen_q//2, max_seqlen_k,
                                     dropout_p, softmax_scale, causal=False, return_softmax=False,
                                     **fa_optional_forward_kwargs
                                 )
@@ -703,10 +873,17 @@ class AttnFuncWithCP(torch.autograd.Function):
                                                               softmax_lse_per_step[i-1])
                     else:
                         if thd:
+                            '''
                             tex.thd_lse_correction(softmax_lse,
                                                    softmax_lse_per_step[i-1],
                                                    cu_seqlens_q,
                                                    q.size(0))
+                            '''
+                            tex.thd_seg_lse_correction(softmax_lse,
+                                                       softmax_lse_per_step[i-1],
+                                                       lse_offset1_q, lse_offset0_q,
+                                                       cu_lens_q,
+                                                       q.size(0)//2)
                         else:
                             flash_attn_fwd_softmax_lse_correction(softmax_lse_[..., 1, :],
                                                                   softmax_lse_per_step[i-1])
@@ -727,12 +904,17 @@ class AttnFuncWithCP(torch.autograd.Function):
 
             if i <= rank or not causal:
                 if thd:
+                    '''
                     tex.thd_out_correction(out,
                                            out_,
                                            softmax_lse,
                                            softmax_lse_per_step[i],
                                            cu_seqlens_q,
                                            False)
+                    '''
+                    tex.thd_seg_out_correction(out, out_, softmax_lse, softmax_lse_per_step[i],
+                                               cu_seqlens_q, cu_seqlens_q, lse_offset0_q, lse_offset0_q,
+                                               cu_seqlens_q, q.size(0))
                 else:
                     flash_attn_fwd_out_correction(out.view(*out_.shape),
                                                   out_,
@@ -740,12 +922,17 @@ class AttnFuncWithCP(torch.autograd.Function):
                                                   softmax_lse_per_step[i])
             else:
                 if thd:
+                    '''
                     tex.thd_out_correction(out,
                                            out_,
                                            softmax_lse,
                                            softmax_lse_per_step[i],
                                            cu_seqlens_q,
                                            True)
+                    '''
+                    tex.thd_seg_out_correction(out, out_, softmax_lse, softmax_lse_per_step[i],
+                                               offset1_q, cu_lens_q, lse_offset1_q, lse_offset0_q,
+                                               cu_lens_q, q.size(0)//2)
                 else:
                     flash_attn_fwd_out_correction(out[:, 1, ...],
                                                   out_,
@@ -759,7 +946,6 @@ class AttnFuncWithCP(torch.autograd.Function):
             out = out.view(-1, *out.shape[-2:])
 
         ctx.save_for_backward(q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k)
-        ctx.thd = thd
         ctx.rng_states = rng_states
         ctx.cp_group = cp_group
         ctx.cp_global_ranks = cp_global_ranks
@@ -770,11 +956,31 @@ class AttnFuncWithCP(torch.autograd.Function):
         ctx.causal = causal
         ctx.deterministic = deterministic
         ctx.use_fused_attention = use_fused_attention
+
+        if thd:
+            ctx.offsets_q = [offset0_q, offset1_q, lse_offset0_q, lse_offset1_q, cu_lens_q]
+            ctx.offsets_k = [offset0_k, offset1_k, lse_offset0_k, lse_offset1_k, cu_lens_k]
+
+        ctx.thd = thd
+        ctx.thd_padding_params_q = thd_padding_params_q
+        ctx.thd_padding_params_k = thd_padding_params_k
+
+        if causal and thd and thd_padding_params_q is not None:
+            ctx.cu_seqlens_q_ = cu_seqlens_q_
+            ctx.cu_seqlens_k_ = cu_seqlens_k_
+            ctx.total_seqlen_q = total_seqlen_q
+            ctx.total_seqlen_k = total_seqlen_k
+            out = tex.thd_padding(out, cu_seqlens_q_, cu_seqlens_q, total_seqlen_q, True)
+
         return out
 
     @staticmethod
     def backward(ctx, dout):
         q, kv, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+
+        if ctx.thd:
+            offset0_q, offset1_q, lse_offset0_q, lse_offset1_q, cu_lens_q = ctx.offsets_q
+            offset0_k, offset1_k, lse_offset0_k, lse_offset1_k, cu_lens_k = ctx.offsets_k
 
         cp_size = get_distributed_world_size(ctx.cp_group)
         rank = get_distributed_rank(ctx.cp_group)
@@ -782,9 +988,15 @@ class AttnFuncWithCP(torch.autograd.Function):
         recv_src = ctx.cp_global_ranks[(rank + 1) % cp_size]
         batch_p2p_comm = int(os.getenv("NVTE_BATCH_MHA_P2P_COMM", "0")) or (cp_size == 2)
 
+        if ctx.causal and ctx.thd and ctx.thd_padding_params_q is not None:
+            dout = tex.thd_padding(dout, ctx.cu_seqlens_q_, cu_seqlens_q, q.size(0), False)
+
         if ctx.causal:
             if ctx.thd:
-                softmax_lse_ = tex.thd_read_half_lse(softmax_lse, cu_seqlens_q, q.size(0))
+                #softmax_lse_ = tex.thd_read_half_lse(softmax_lse, cu_seqlens_q, q.size(0))
+                b, np, t = softmax_lse.size()
+                softmax_lse_ = torch.empty([b, np, t//2], dtype=softmax_lse.dtype, device=softmax_lse.device)
+                tex.thd_seg_read_lse(softmax_lse_, softmax_lse, lse_offset0_q, lse_offset1_q, cu_lens_q, t//2)
             else:
                 # [b, np, sq] -> [b, np, 2, sq//2]
                 softmax_lse_ = softmax_lse.view(*softmax_lse.shape[:-1], 2, softmax_lse.shape[-1]//2)
@@ -903,7 +1115,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                         dq_ = torch.empty_like(q_)
                         if ctx.thd:
                             # [2, t, np, hn] -> [2, t/2, np, hn]
-                            kv_ = tex.thd_read_half_tensor(kv, cu_seqlens_k, 0)
+                            kv_ = torch.empty([2, kv.size(1)//2, kv.size(2), kv.size(3)], dtype=kv.dtype, device=kv.device)
+                            tex.thd_segment_copy(kv_, kv, cu_lens_k, offset0_k, cu_lens_k, kv.size(1)//2)
+                            #kv_ = tex.thd_read_half_tensor(kv, cu_seqlens_k, 0)
                         else:
                             # [2, b, 2, sk//2, np, hn] -> [2, b, sk//2, np, hn] -> [2, b*sk//2, np, hn]
                             kv_ = kv[:, :, 0, ...].contiguous().view(2, -1, *kv.shape[-2:])
@@ -944,7 +1158,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                     else:
                         if ctx.thd:
                             # [t, np, hn] -> [t/2, np, hn]
-                            q_ = tex.thd_read_half_tensor(q, cu_seqlens_q, 1)
+                            #q_ = tex.thd_read_half_tensor(q, cu_seqlens_q, 1)
+                            q_ = torch.empty([q.size(0)//2, q.size(1), q.size(2)], dtype=q.dtype, device=q.device)
+                            tex.thd_segment_copy(q_, q, cu_lens_q, offset1_q, cu_lens_q, q.size(0)//2)
                         else:
                             # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                             q_ = q[:, 1, ...].contiguous().view(-1, *q.shape[-2:])
@@ -953,8 +1169,12 @@ class AttnFuncWithCP(torch.autograd.Function):
                         kv_ = kv.view(2, -1, *kv.shape[-2:])
                         dkv_ = torch.empty_like(kv_)
                         if ctx.thd:
-                            out_ = tex.thd_read_half_tensor(out, cu_seqlens_q, 1)
-                            dout_ = tex.thd_read_half_tensor(dout, cu_seqlens_q, 1)
+                            #out_ = tex.thd_read_half_tensor(out, cu_seqlens_q, 1)
+                            #dout_ = tex.thd_read_half_tensor(dout, cu_seqlens_q, 1)
+                            out_ = torch.empty([out.size(0)//2, out.size(1), out.size(2)], dtype=out.dtype, device=out.device)
+                            tex.thd_segment_copy(out_, out, cu_lens_q, offset1_q, cu_lens_q, out.size(0)//2)
+                            dout_ = torch.empty([dout.size(0)//2, dout.size(1), dout.size(2)], dtype=dout.dtype, device=dout.device)
+                            tex.thd_segment_copy(dout_, dout, cu_lens_q, offset1_q, cu_lens_q, dout.size(0)//2)
                         else:
                             # [b, 2, sq//2, np, hn] -> [b, sq//2, np, hn] -> [b*sq//2, np, hn]
                             out_ = out[:, 1, ...].contiguous().view(-1, *out.shape[-2:])
@@ -1019,18 +1239,22 @@ class AttnFuncWithCP(torch.autograd.Function):
                         dq.copy_(dq_)
                     else:
                         if ctx.thd:
-                            tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "copy", "add")
+                            tex.thd_segment_copy(dq, dq_, offset0_q, offset0_q, cu_lens_q, q.size(0)//2)
+                            tex.thd_segment_add(dq, dq_, offset1_q, offset1_q, cu_lens_q, q.size(0)//2)
+                            #tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "copy", "add")
                         else:
                             dq[:, 0, ...].copy_(dq_[:, 0, ...])
                             dq[:, 1, ...].add_(dq_[:, 1, ...])
                 elif i > 0:
                     if ctx.thd:
-                        tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "none", "add")
+                        #tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "none", "add")
+                        tex.thd_segment_add(dq, dq_, offset1_q, cu_lens_q, cu_lens_q, q.size(0)//2)
                     else:
                         dq[:, 1, ...].add_(dq_)
                 else:
                     if ctx.thd:
-                        tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "none", "copy")
+                        #tex.thd_grad_correction(dq, dq_, cu_seqlens_q, "none", "copy")
+                        tex.thd_segment_copy(dq, dq_, offset1_q, cu_lens_q, cu_lens_q, q.size(0)//2)
                     else:
                         dq[:, 1, ...].copy_(dq_)
             else:
@@ -1060,7 +1284,9 @@ class AttnFuncWithCP(torch.autograd.Function):
                 if i == (cp_size-1):
                     if rank == 0:
                         if ctx.thd:
-                            tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "add", "copy")
+                            #tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "add", "copy")
+                            tex.thd_segment_add(dkv, dkv_, offset0_k, offset0_k, cu_lens_k, dkv.size(1)//2)
+                            tex.thd_segment_copy(dkv, dkv_, offset1_k, offset1_k, cu_lens_k, dkv.size(1)//2)
                         else:
                             dkv[:, :, 0, ...].add_(dkv_[:, :, 0, ...])
                             dkv[:, :, 1, ...].copy_(dkv_[:, :, 1, ...])
@@ -1069,12 +1295,14 @@ class AttnFuncWithCP(torch.autograd.Function):
                 elif i >= (cp_size-rank-1):
                     if i == 0 and rank == (cp_size-1):
                         if ctx.thd:
-                            tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "copy", "none")
+                            # tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "copy", "none")
+                            tex.thd_segment_copy(dkv, dkv_, offset0_k, cu_lens_k, cu_lens_k, dkv.size(1)//2)
                         else:
                             dkv[:, :, 0, ...].copy_(dkv_)
                     else:
                         if ctx.thd:
-                            tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "add", "none")
+                            #tex.thd_grad_correction(dkv, dkv_, cu_seqlens_k, "add", "none")
+                            tex.thd_segment_add(dkv, dkv_, offset0_k, cu_lens_k, cu_lens_k, dkv.size(1)//2)
                         else:
                             dkv[:, :, 0, ...].add_(dkv_)
                 elif i > 0:
@@ -1093,14 +1321,22 @@ class AttnFuncWithCP(torch.autograd.Function):
             # [2, b, 2, sk//2, np, hn] -> [2, b, sk, np, hn]
             dkv = dkv.view(*kv.shape[0:2], -1, *kv.shape[-2:])
 
-        return None, dq, dkv[0], dkv[1], None, None, None, None, None, None, \
-                None, None, None, None, None, None
+        if ctx.causal and ctx.thd and ctx.thd_padding_params_q is not None:
+            dq = tex.thd_padding(dq,     ctx.cu_seqlens_q_, cu_seqlens_q, ctx.total_seqlen_q, True)
+            dk = tex.thd_padding(dkv[0], ctx.cu_seqlens_k_, cu_seqlens_k, ctx.total_seqlen_k, True)
+            dv = tex.thd_padding(dkv[1], ctx.cu_seqlens_k_, cu_seqlens_k, ctx.total_seqlen_k, True)
+        else:
+            dk = dkv[0]
+            dv = dkv[1]
+
+        return None, dq, dk, dv, None, None, None, None, None, None, \
+                None, None, None, None, None, None, None, None
 
 
 def attn_forward_func_with_cp(
     is_training, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, dropout_p,
     cp_group, cp_global_ranks, cp_stream, softmax_scale=None, attn_mask_type="causal",
-    deterministic=False, use_fused_attention=False
+    deterministic=False, use_fused_attention=False, thd_padding_params_q=None, thd_padding_params_k=None,
 ) -> torch.Tensor:
     """Attention implementation with context parallelism"""
     assert (attn_mask_type in ["causal", "no_mask"]
@@ -1108,7 +1344,7 @@ def attn_forward_func_with_cp(
     out = AttnFuncWithCP.apply(
         is_training, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         dropout_p, cp_group, cp_global_ranks, cp_stream, softmax_scale, attn_mask_type,
-        deterministic, use_fused_attention
+        deterministic, use_fused_attention, thd_padding_params_q, thd_padding_params_k
     )
     return out
 
@@ -1763,6 +1999,8 @@ class FlashAttention(torch.nn.Module):
         cp_group: Optional[dist_group_type] = None,
         cp_global_ranks: List[int] = None,
         cp_stream: torch.cuda.Stream = None,
+        thd_padding_params_q = None,
+        thd_padding_params_k = None,
     ) -> torch.Tensor:
         """flash-attn fprop"""
 
@@ -1881,7 +2119,9 @@ class FlashAttention(torch.nn.Module):
                     cp_group, cp_global_ranks, cp_stream,
                     softmax_scale=1.0/self.norm_factor,
                     attn_mask_type=attn_mask_type,
-                    deterministic=self.deterministic
+                    deterministic=self.deterministic,
+                    thd_padding_params_q=thd_padding_params_q,
+                    thd_padding_params_k=thd_padding_params_k
                 )
         else:
 
@@ -2232,6 +2472,8 @@ class FusedAttention(torch.nn.Module):
         cp_group: Optional[dist_group_type] = None,
         cp_global_ranks: List[int] = None,
         cp_stream: torch.cuda.Stream = None,
+        thd_padding_params_q = None,
+        thd_padding_params_k = None,
     ) -> torch.Tensor:
         """fused attention fprop"""
 
@@ -2319,6 +2561,8 @@ class FusedAttention(torch.nn.Module):
                     softmax_scale=1.0/self.norm_factor,
                     attn_mask_type=attn_mask_type,
                     use_fused_attention=True,
+                    thd_padding_params_q=thd_padding_params_q,
+                    thd_padding_params_k=thd_padding_params_k,
                 )
             if qkv_format == 'sbhd':
                 output = output.transpose(0,1).contiguous()
@@ -2604,6 +2848,8 @@ class DotProductAttention(torch.nn.Module):
         alibi_slopes: Optional[torch.Tensor] = None,
         fast_zero_fill: bool = True,
         inference_params: Optional[InferenceParams] = None,
+        thd_padding_params_q = None,
+        thd_padding_params_k = None,
     ) -> torch.Tensor:
         """
         Dot Product Attention Layer.
@@ -2999,7 +3245,9 @@ class DotProductAttention(torch.nn.Module):
                                         cp_global_ranks=self.cp_global_ranks,
                                         cp_stream=self.cp_stream,
                                         max_seqlen_q=max_seqlen_q,
-                                        max_seqlen_kv=max_seqlen_kv)
+                                        max_seqlen_kv=max_seqlen_kv,
+                                        thd_padding_params_q=thd_padding_params_q,
+                                        thd_padding_params_k=thd_padding_params_k)
 
         if use_fused_attention:
             if _NVTE_DEBUG:
@@ -3024,7 +3272,9 @@ class DotProductAttention(torch.nn.Module):
                     cp_global_ranks=self.cp_global_ranks,
                     cp_stream=self.cp_stream,
                     max_seqlen_q=max_seqlen_q,
-                    max_seqlen_kv=max_seqlen_kv)
+                    max_seqlen_kv=max_seqlen_kv,
+                    thd_padding_params_q=thd_padding_params_q,
+                    thd_padding_params_k=thd_padding_params_k)
             return self.fused_attention(
                 query_layer,
                 key_layer,
@@ -3042,7 +3292,9 @@ class DotProductAttention(torch.nn.Module):
                 cp_global_ranks=self.cp_global_ranks,
                 cp_stream=self.cp_stream,
                 max_seqlen_q=max_seqlen_q,
-                max_seqlen_kv=max_seqlen_kv)
+                max_seqlen_kv=max_seqlen_kv,
+                thd_padding_params_q=thd_padding_params_q,
+                thd_padding_params_k=thd_padding_params_k)
 
         assert (not context_parallel), \
             "Context parallelism is only implemented with Flash Attention and Fused Attention!"
