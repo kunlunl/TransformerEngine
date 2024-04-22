@@ -121,7 +121,12 @@ def run_dpa_with_cp(dtype='bf16', model=None, qkv_format='bshd', kernel_backend=
     q_, k_, v_ = [x.requires_grad_() for x in [q_, k_, v_]]
     core_attn.set_context_parallel_group(cp_comm_group, cp_comm_ranks, torch.cuda.Stream())
 
-    out_ = core_attn(q_, k_, v_, cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv)
+    max_seqlen_q  = config.max_seqlen_q
+    max_seqlen_kv = config.max_seqlen_kv
+
+    out_ = core_attn(q_, k_, v_,
+                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_kv=cu_seqlens_kv,
+                     max_seqlen_q=max_seqlen_q, max_seqlen_kv=max_seqlen_kv)
     out_.backward(dout_)
 
     for x in [out_, q_.grad, k_.grad, v_.grad]:
