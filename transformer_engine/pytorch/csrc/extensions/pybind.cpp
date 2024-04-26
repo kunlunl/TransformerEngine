@@ -114,6 +114,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Correct the THD format output of context parallelism in forward pass");
   m.def("thd_grad_correction", &thd_grad_correction,
         "Correct the THD format gradients of context parallelism in backward pass");
+  m.def("thd_segment_copy", &thd_segment_copy,
+        "Do padding for the case where seqlens is not divisible by cp_size*2");
   m.def("thd_get_partitioned_indices", &thd_get_partitioned_indices,
         "Generate partitioned indices for inputs in THD format");
 

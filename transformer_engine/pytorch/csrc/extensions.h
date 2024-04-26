@@ -674,6 +674,12 @@ void thd_grad_correction(at::Tensor &grad,
                          const std::string &second_half
 );
 
+at::Tensor thd_segment_copy(const at::Tensor &src,
+                            const at::Tensor &cu_seqlens_src,
+                            const at::Tensor &cu_seqlens_dst,
+                            int dst_len
+);
+
 at::Tensor thd_get_partitioned_indices(const at::Tensor &cu_seqlens,
                                        int total_tokens,
                                        int world_size,

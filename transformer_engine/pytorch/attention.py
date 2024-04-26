@@ -506,6 +506,36 @@ def flash_attn_fwd_softmax_lse_correction(softmax_lse, softmax_lse_per_step):
     softmax_lse.copy_(new_scale)
 
 
+class PaddingParams:
+    """
+    Stores the parameters which are used to pad the input tensors when at least one seqlen is not
+    divisible by (cp_size*2).
+
+    Because the max_seqlen and total_tokens need to be copied to the CPU, it's better to create
+    these parameters once before each iteration and reuse them, instead of recalculating them in
+    each layer.
+    """
+
+    def __init__(
+        self,
+        global_cu_seqlens: torch.Tensor,
+        world_size: int,
+        rank: int
+    ):
+        lens = global_cu_seqlens[1:] - global_cu_seqlens[:-1]
+        lens_after_padding = (lens + 2*world_size - 1) // (2*world_size) * 2
+        cu_seqlens_after_padding = torch.cumsum([torch.cat([zeros[:1], lens_after_padding], dim=0)])
+        cu_seqlens_after_padding = cu_seqlens_after_padding.to(global_cu_seqlens.dtype)
+
+        self.cu_seqlens_after_padding = padded_cu_seqlens
+        # The following three lines will cause synchronize between CPU and GPU, so it's better to
+        # calculate it once before each iteration starts, instead of recalculating them in each
+        # layer.
+        self.max_seqlen_after_padding = torch.max(padded_lens).item()
+        self.total_tokens_after_padding = padded_cu_seqlens[-1].item()
+        self.skip = torch.all(lens % (2*world_size) == 0).item()
+
+
 class AttnFuncWithCP(torch.autograd.Function):
     """
     Attention implementation with context parallelism.
@@ -516,7 +546,7 @@ class AttnFuncWithCP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, is_training, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                 dropout_p, cp_group, cp_global_ranks, cp_stream, softmax_scale, attn_mask_type,
-                deterministic, use_fused_attention):
+                deterministic, use_fused_attention, padding_params_q=None, padding_params_k=None):
         if softmax_scale is None:
             softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -528,6 +558,64 @@ class AttnFuncWithCP(torch.autograd.Function):
 
         causal = (attn_mask_type == "causal")
         thd = (len(q.shape) == 3)
+
+        if thd:
+            assert((padding_params_q is None and padding_params_k is None) or \
+                   (padding_params_q is not None and padding_params_k is not None)), \
+                   "padding_params_q and padding_params_k must both be None or both not be None"
+
+            if padding_params_q is None:
+                warnings.warn(
+                    "Partition information is infered from cu_seqlens with assumption that "
+                    "all seqlens are divisible by cp_size * 2. If this is not the case, "
+                    "please pass in the partition params."
+                )
+
+            if padding_params_q is not None:
+                if padding_params_q.skip and padding_params_k.skip:
+                    # All seqlens are divisible by cp_size*2
+                    padding_params_q = None
+                    padding_params_k = None
+
+            # This branch is to handle the situation where at least one seqlen is not divisible by
+            # "cp_size * 2" by padding zeros to the input tensors.
+            if padding_params_q is not None:
+                # The original total number of tokens and cu_seqlens need to be saved so that we
+                # can un-padding the out/dq/dk/dv later.
+                original_total_tokens_q = q.shape[0]
+                original_total_tokens_k = k.shape[0]
+                original_cu_seqlens_q = cu_seqlens_q
+                original_cu_seqlens_k = cu_seqlens_k
+
+                total_tokens_q = padding_params_q.total_tokens_after_padding
+                total_tokens_k = padding_params_k.total_tokens_after_padding
+
+                if causal:
+                    # For causal mask, the max_seqlen and cu_seqlens may change after padding, so
+                    # we need to update the max_seqlen and cu_seqlens for both q and kv.
+                    max_seqlen_q = padding_params_q.max_seqlen_after_padding
+                    max_seqlen_k = padding_params_k.max_seqlen_after_padding
+                    cu_seqlens_q = padding_params_q.cu_seqlens_after_padding
+                    cu_seqlens_k = padding_params_k.cu_seqlens_after_padding
+
+                    # Note that we need to pad zeros to the tail of each sequence, not the tail of
+                    # the whole tensor.
+                    q = tex.thd_segment_copy(q, original_cu_seqlens_q, cu_seqlens_q, total_tokens_q)
+                    k = tex.thd_segment_copy(k, original_cu_seqlens_k, cu_seqlens_k, total_tokens_k)
+                    v = tex.thd_segment_copy(v, original_cu_seqlens_k, cu_seqlens_k, total_tokens_k)
+                else:
+                    # For non-causal masks, we only need to pad zeros to the tail of the original
+                    # inputs. (The purpose is to make the tensors participating in the communication
+                    # have the same shape)
+                    q_ = torch.zeros([total_tokens_q, *q.shape[1:]], dtype=q.dtype, device=q.device)
+                    k_ = torch.zeros([total_tokens_k, *k.shape[1:]], dtype=k.dtype, device=k.device)
+                    v_ = torch.zeros([total_tokens_k, *v.shape[1:]], dtype=v.dtype, device=v.device)
+                    t_q = min(q_.shape[0], q.shape[0])
+                    t_k = min(k_.shape[0], k.shape[0])
+                    q_[:t_q] = q[:t_q]
+                    k_[:t_k] = k[:t_k]
+                    v_[:t_k] = v[:t_k]
+                    q, k, v = q_, k_, v_
 
         if causal and not thd:
             # [b, s, np, hn] -> [b, 2, s//2, np, hn]
@@ -789,6 +877,28 @@ class AttnFuncWithCP(torch.autograd.Function):
         ctx.causal = causal
         ctx.deterministic = deterministic
         ctx.use_fused_attention = use_fused_attention
+        ctx.padding_params_q = padding_params_q
+        ctx.padding_params_k = padding_params_k
+
+        if thd and padding_params_q is not None:
+            # The original total number of tokens and cu_seqlens need to be saved so that we
+            # can un-padding the dq/dk/dv later.
+            ctx.original_total_tokens_q = original_total_tokens_q
+            ctx.original_total_tokens_k = original_total_tokens_k
+            ctx.original_cu_seqlens_q = original_cu_seqlens_q
+            ctx.original_cu_seqlens_k = original_cu_seqlens_k
+
+            # un-padding the output
+            if causal:
+                out = tex.thd_segment_copy(
+                    out, cu_seqlens_q, original_cu_seqlens_q, original_total_tokens_q)
+            else:
+                out_ = torch.zeros(
+                    [original_total_tokens_q, *out.shape[1:]], dtype=out.dtype, device=out.device)
+                t_q = min(out_.shape[0], out.shape[0])
+                out_[:t_q] = out[:t_q]
+                out = out_
+
         return out
 
     @staticmethod
@@ -800,6 +910,18 @@ class AttnFuncWithCP(torch.autograd.Function):
         send_dst = ctx.cp_global_ranks[(rank + cp_size - 1) % cp_size]
         recv_src = ctx.cp_global_ranks[(rank + 1) % cp_size]
         batch_p2p_comm = int(os.getenv("NVTE_BATCH_MHA_P2P_COMM", "0")) or (cp_size == 2)
+
+        # Do padding for dout to handle the situation where at least one seqlen is not divisible by
+        # "cp_size * 2"
+        if ctx.thd and ctx.padding_params_q is not None:
+            if ctx.causal:
+                dout = tex.thd_segment_copy(
+                    dout, ctx.original_cu_seqlens_q, cu_seqlens_q, q.size(0))
+            else:
+                dout_ = torch.zeros_like(q)
+                t_q = min(dout_.size(0), dout.size(0))
+                dout_[:t_q] = dout[:t_q]
+                dout = dout_
 
         if ctx.causal:
             if ctx.thd:
@@ -1113,8 +1235,34 @@ class AttnFuncWithCP(torch.autograd.Function):
             # [2, b, 2, sk//2, np, hn] -> [2, b, sk, np, hn]
             dkv = dkv.view(*kv.shape[0:2], -1, *kv.shape[-2:])
 
-        return None, dq, dkv[0], dkv[1], None, None, None, None, None, None, \
-                None, None, None, None, None, None
+        # Do un-padding for dq/dk/dv when there is at least one seqlen is not divisible by cp_size*2
+        if ctx.thd and ctx.padding_params_q is not None:
+            if ctx.causal:
+                dq = tex.thd_segment_copy(
+                    dq, cu_seqlens_q, ctx.original_cu_seqlens_q, ctx.original_total_tokens_q)
+                dk = tex.thd_segment_copy(
+                    dkv[0], cu_seqlens_k, ctx.original_cu_seqlens_k, ctx.original_total_tokens_k)
+                dv = tex.thd_segment_copy(
+                    dkv[1], cu_seqlens_k, ctx.original_cu_seqlens_k, ctx.original_total_tokens_k)
+            else:
+                dq_ = torch.zeros([ctx.original_total_tokens_q, *dq.shape[1:]], dtype=dq.dtype,
+                                  device=dq.device)
+                dk_ = torch.zeros([ctx.original_total_tokens_k, *dkv.shape[2:]], dtype=dkv.dtype,
+                                  device=dkv.device)
+                dv_ = torch.zeros([ctx.original_total_tokens_k, *dqv.shape[2:]], dtype=dkv.dtype,
+                                  device=dkv.device)
+                t_q = min(dq_.size(0), dq.size(0))
+                t_k = min(dk_.size(0), dk.size(0))
+                dq_[:t_q] = dq[:t_q]
+                dk_[:t_k] = dk[:t_k]
+                dv_[:t_k] = dv[:t_k]
+                dq, dk, dv = dq_, dk_, dv_
+        else:
+            dk = dkv[0]
+            dv = dkv[1]
+
+        return None, dq, dk, dv, None, None, None, None, None, None, \
+                None, None, None, None, None, None, None, None
 
 
 def attn_forward_func_with_cp(

@@ -1994,6 +1994,95 @@ void thd_grad_correction(at::Tensor &grad,
 }
 
 /***************************************************************************************************
+ * Support THD format for Context Parallel:
+ * Do padding for the situation where seqlen is not divisible by cp*2
+ **************************************************************************************************/
+
+__global__ void thd_segment_copy_kernel(void *dst,
+                                        const void *src,
+                                        const int *cu_seqlens_dst,
+                                        const int *cu_seqlens_src,
+                                        int batch,
+                                        int hidden_size_in_bytes,
+                                        int dst_len) {
+  extern __shared__ int smem[];
+  int *smem_dst = &smem[0];
+  int *smem_src = &smem[batch + 1];
+  for (int i = threadIdx.x; i <= batch; i += blockDim.x) {
+    smem_dst[i] = cu_seqlens_dst[i];
+    smem_src[i] = cu_seqlens_src[i];
+  }
+  __syncthreads();
+
+  const int warpid = (blockDim.x * blockIdx.x + threadIdx.x) / 32;
+  const int num_warps = (blockDim.x * gridDim.x) / 32;
+  const int laneid = threadIdx.x % 32;
+
+  for (int i = warpid; i < smem_dst[batch]; i += num_warps) {
+    float4 *dst_token = (float4*)((char*)dst + i * (size_t)hidden_size_in_bytes);
+
+    int seqid = binary_search(i, smem_dst, batch + 1);
+    int offset = i - smem_dst[seqid] + smem_src[seqid];
+
+    if (offset < smem_src[seqid + 1]) {
+      float4 *src_token = (float4*)((char*)src + offset * (size_t)hidden_size_in_bytes);
+      for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+        dst_token[j] = src_token[j];
+      }
+    } else {
+      for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+        dst_token[j] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+      }
+    }
+  }
+
+  for (int i = smem_dst[batch] + warpid; i < dst_len; i += num_warps) {
+    float4 *dst_token = (float4*)((char*)dst + i * (size_t)hidden_size_in_bytes);
+    for (int j = laneid; j < hidden_size_in_bytes / sizeof(float4); j += 32) {
+      dst_token[j] = float4{0.0f, 0.0f, 0.0f, 0.0f};
+    }
+  }
+}
+
+at::Tensor thd_segment_copy(const at::Tensor &src,
+                            const at::Tensor &cu_seqlens_src,
+                            const at::Tensor &cu_seqlens_dst,
+                            int dst_len) {
+  NVTE_CHECK(src.dim() == 3);
+  NVTE_CHECK(cu_seqlens_src.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens_src.dim() == 1);
+  NVTE_CHECK(cu_seqlens_src.size(0) >= 2);
+  NVTE_CHECK(cu_seqlens_dst.scalar_type() == at::ScalarType::Int);
+  NVTE_CHECK(cu_seqlens_dst.dim() == 1);
+  NVTE_CHECK(cu_seqlens_dst.size(0) == cu_seqlens_src.size(0));
+
+  int batch     = cu_seqlens_src.size(0) - 1;
+  int num_heads = src.size(1);
+  int head_dim  = src.size(2);
+  int hidden_size_in_bytes = num_heads * head_dim * c10::elementSize(src.scalar_type());
+
+  // For 128-bits load/stroe
+  NVTE_CHECK(hidden_size_in_bytes % 16 == 0);
+
+  std::vector<int64_t> shape{dst_len, num_heads, head_dim};
+  at::Tensor dst = at::empty(shape, at::CUDA(src.scalar_type()));
+
+  constexpr unsigned int block = 256;
+  unsigned int grid = (dst_len * 32 + block - 1) / block;
+  thd_padding_kernel<<<grid, block, sizeof(int) * (batch+1) * 2,
+                       at::cuda::getCurrentCUDAStream()>>>(
+    dst.data_ptr(),
+    src.data_ptr(),
+    cu_seqlens_dst.data_ptr<int>(),
+    cu_seqlens_src.data_ptr<int>(),
+    batch,
+    hidden_size_in_bytes,
+    dst_len);
+
+  return dst;
+}
+
+/***************************************************************************************************
  * Support THD format for Context Parallel: Generate partitioned indices for input tokens
  **************************************************************************************************/
 
