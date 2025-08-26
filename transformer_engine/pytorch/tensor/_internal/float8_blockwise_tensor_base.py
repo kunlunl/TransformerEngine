@@ -323,9 +323,15 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         rowwise_data = self._rowwise_data
         if not rowwise_data.is_contiguous():
             rowwise_data = rowwise_data.contiguous()
-        self._columnwise_data = tex.fp8_transpose(
-            rowwise_data, self._fp8_dtype, out=self._columnwise_data
-        )
+        if self._saved_columnwise_data is not None:
+            self._columnwise_data = tex.fp8_transpose(
+                rowwise_data, self._fp8_dtype, out=self._saved_columnwise_data
+            )
+            self._saved_columnwise_data = None
+        else:
+            self._columnwise_data = tex.fp8_transpose(
+                rowwise_data, self._fp8_dtype, out=self._columnwise_data
+            )
 
         if self._columnwise_scale_inv is None:
             assert self._quantizer is not None, (
@@ -333,11 +339,18 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
                 "quantized tensors are supposed to be generated from the quantizer."
             )
             columnwise_scale_inv_shape = self._quantizer.get_scale_shape(rowwise_data.shape, True)
-            self._columnwise_scale_inv = torch.empty(
-                columnwise_scale_inv_shape,
-                dtype=self._rowwise_scale_inv.dtype,
-                device=self._rowwise_scale_inv.device,
-            )
+            if self._saved_columnwise_scale_inv is not None:
+                assert self._saved_columnwise_scale_inv.shape == columnwise_scale_inv_shape
+                assert self._saved_columnwise_scale_inv.dtype == self._rowwise_scale_inv.dtype
+                assert self._saved_columnwise_scale_inv.device == self._rowwise_scale_inv.device
+                self._columnwise_scale_inv = self._saved_columnwise_scale_inv
+                self._saved_columnwise_scale_inv = None
+            else:
+                self._columnwise_scale_inv = torch.empty(
+                    columnwise_scale_inv_shape,
+                    dtype=self._rowwise_scale_inv.dtype,
+                    device=self._rowwise_scale_inv.device,
+                )
         assert len(self._rowwise_scale_inv.shape) == 2
         assert len(self._columnwise_scale_inv.shape) == 2
         rowwise_scale_inv = self._rowwise_scale_inv
@@ -405,6 +418,8 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
             assert (
                 self._rowwise_data is not None and self._rowwise_scale_inv is not None
             ), "Cannot update to rowwise usage."
+            self._saved_columnwise_data = self._columnwise_data
+            self._saved_columnwise_scale_inv = self._columnwise_scale_inv
             self._columnwise_data = None
             self._columnwise_scale_inv = None
             return
