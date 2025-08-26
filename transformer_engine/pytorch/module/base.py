@@ -1226,6 +1226,7 @@ class TransformerEngineBaseModule(torch.nn.Module, ABC):
 
                 # Quantize parameter
                 param = quantizer(param)
+                param.update_usage(rowwise_usage=True, columnwise_usage=False)
 
             # Redo parameter wrap in case we broke it above
             # NOTE: Currently this can only be broken when primary weights are in Fp8 but
