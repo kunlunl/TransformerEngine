@@ -65,6 +65,8 @@ class Float8BlockwiseQTensorBase(QuantizedTensorBase):
         instance._columnwise_scale_inv = columnwise_scale_inv
         instance._is_2D_scaled = is_2D_scaled
         instance._data_format = data_format
+        instance._saved_columnwise_data = None
+        instance._saved_columnwise_scale_inv = None
 
         return instance
 
