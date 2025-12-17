@@ -145,13 +145,26 @@ __global__ void __launch_bounds__(kThreadsPerBlock)
     }
     const int row_in_output = tile_h * kTileDim + row_in_smem;
     const int col_in_output = tile_w * kTileDim + col_in_smem;
-    const size_t idx_in_output = static_cast<size_t>(row_in_output) * w + col_in_output;
+    size_t idx_in_output = static_cast<size_t>(row_in_output) * w + col_in_output;
     if (row_in_output < h) {
-      if constexpr (kWidthAligned) {
+      if constexpr (false) {
         vec_output.store_to(output_minus_offset + idx_in_output);
       } else {
         int num = min(static_cast<size_t>(kNumOutputElemsPerBank),
                       static_cast<size_t>(col_in_output < w ? w - col_in_output : 0));
+        num = min(static_cast<size_t>(num), idx_in_output < end_offset ? end_offset - idx_in_output : 0);
+        if (idx_in_output < start_offset) {
+          int num_ = start_offset - idx_in_output;
+          if (num_ < num) {
+            num -= num_;
+            idx_in_output += num_;
+          } else {
+            continue;
+          }
+        }
+        if (threadIdx.x == 0) {
+          printf("idx_in_output: %ld, num: %d\n", idx_in_output, num);
+        }
         vec_output.store_to_elts(output_minus_offset, idx_in_output, num);
       }
     }
