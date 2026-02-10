@@ -371,6 +371,51 @@ __device__ __forceinline__ e8m0_t float_to_e8m0(float val) {
   }
 }
 
+__device__ __forceinline__ e8m0_t float_to_e8m0_specialized(float amax) {
+  // amax -> decode scale
+
+  constexpr float epsilon = 0.f;
+  // NOTE: NAN amax evaluates false for <, handled further down.
+  if (amax < epsilon) {
+    amax = epsilon;
+  }
+
+  float scale = 1.f;
+
+  if (isinf(amax) || amax == 0.f || isnan(amax)) {
+    return scale;
+  }
+
+  // Here we don't use "scale = max_fp8 / amax" because it has different results with/without
+  // "--use_fast_math".
+  // "__fdiv_rn" has the same behavior with "max_fp8 / amax" when not using fast math.
+  constexpr float max_fp8 = 448.f;
+  scale = __fdiv_rn(max_fp8, amax);
+
+  e8m0_t exponent;
+
+  // The amax is too small that the scale becoming infinite in FP32. In other word,
+  // the scale is not representable in FP32.
+  if (isinf(scale)) {
+    // use fp32 max to represent the scale
+    // scale = value_for_inf;
+    exponent = 0xFE;  // 1111 1110
+  }
+
+  constexpr bool force_pow_2_scales = true;
+  if (force_pow_2_scales) {
+    uint32_t scale_bits = *reinterpret_cast<uint32_t *>(&scale);
+    scale_bits &= 0xFF800000;
+    // If the exponent was zero, we have a logic error.
+    __builtin_assume(scale_bits != 0 || scale == 0.0);
+    __builtin_assume(scale_bits != 0x80000000);
+    // scale = *reinterpret_cast<float *>(&scale_bits);
+    exponent = (scale_bits >> FP32_MANTISSA_BITS);
+  }
+
+  return static_cast<e8m0_t>(254 - exponent);
+}
+
 // https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#data-movement-and-conversion-instructions-cp-async-bulk-tensor
 // shared::cta -> global
 __device__ __forceinline__ void cp_async_bulk_tensor_1d_shared_to_global(uint64_t *dst_global_ptr,

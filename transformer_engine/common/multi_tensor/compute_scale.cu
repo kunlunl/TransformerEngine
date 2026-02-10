@@ -91,6 +91,8 @@ void multi_tensor_compute_scale_and_scale_inv_cuda(int chunk_size, Tensor noop_f
 void multi_tensor_compute_scale_inv_e8m0_cuda(int chunk_size,
                                               std::vector<std::vector<Tensor *>> tensor_lists,
                                               cudaStream_t stream) {
+  NVTE_CHECK(false, "You should not be here!");
+
   NVTE_CHECK(tensor_lists[0][0]->data.dtype == DType::kBFloat16, "amax should be bf16");
   auto scale_inv_dtype = tensor_lists[1][0]->data.dtype;
   NVTE_CHECK(scale_inv_dtype == DType::kByte || scale_inv_dtype == DType::kFloat8E8M0,

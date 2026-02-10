@@ -276,8 +276,10 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
       }
 
       // 2. Compute E8M0 scaling factor
+      // const e8m0_t biased_exponent =
+      //     ptx::float_to_e8m0(thread_amax * Quantized_Limits<OType>::max_norm_rcp);
       const e8m0_t biased_exponent =
-          ptx::float_to_e8m0(thread_amax * Quantized_Limits<OType>::max_norm_rcp);
+          ptx::float_to_e8m0_specialized(thread_amax);
       const size_t global_scales_offset_Y = scales_offset_Y_colwise + stage;
       const size_t global_scales_offset_X = scales_offset_X_colwise;
       size_t scale_idx;
@@ -461,7 +463,8 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK)
         // Broadcast: each thread gets scale from lane matching its tid_X_rowwise
         biased_exponent = __shfl_sync(0xffffffff, scale_from_shmem, tid_X_rowwise);
       } else {
-        biased_exponent = ptx::float_to_e8m0(thread_amax * Quantized_Limits<OType>::max_norm_rcp);
+        // biased_exponent = ptx::float_to_e8m0(thread_amax * Quantized_Limits<OType>::max_norm_rcp);
+        biased_exponent = ptx::float_to_e8m0_specialized(thread_amax);
       }
       const int stage_scales_offset_Y = scales_offset_Y_rowwise + stage_offset_Y;
       const int stage_scales_offset_X = scales_offset_X_rowwise;
@@ -688,8 +691,9 @@ void quantize(const Tensor &input, const Tensor *act_input, const Tensor *noop, 
           TRANSFORMER_ENGINE_SWITCH_CONDITION(
               with_gemm_swizzled_scales, WITH_GEMM_SWIZZLED_SCALES,
 
-              if (specialized::hasSpec<IS_DBIAS, IS_DACT, IS_ACT, IType, OType>() &&
-                  !WITH_GEMM_SWIZZLED_SCALES && !use_2d_quantization) {
+              // if (specialized::hasSpec<IS_DBIAS, IS_DACT, IS_ACT, IType, OType>() &&
+              //     !WITH_GEMM_SWIZZLED_SCALES && !use_2d_quantization) {
+              if (false) {  // Skip specialized kernel for now
                 switch (scaling_type) {
                   case ScalingType::ROWWISE: {
                     using traits = specialized::CastTraits<IType, OType, true, false>;
